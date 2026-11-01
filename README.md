@@ -52,12 +52,41 @@ openssl version
 
 ## Instalasi dan menjalankan
 
-Simpan `postgres-manager.sh` di server, lalu jalankan:
+Semua file yang dibuat script (`.env`, `compose.yaml`, `data/`, `certs/`,
+`config/`, `backups/`, dst.) disimpan di **folder tempat
+`postgres-manager.sh` berada**. Jadi pilih folder khusus untuk satu instance
+PostgreSQL, misalnya `/opt/postgres`:
+
+``` bash
+sudo git clone https://github.com/raqolbi/postgresql-docker-manager.git /opt/postgres
+cd /opt/postgres
+sudo ./postgres-manager.sh
+```
+
+Atau salin `postgres-manager.sh` saja ke folder tersebut, lalu jalankan:
 
 ``` bash
 chmod +x postgres-manager.sh
 sudo ./postgres-manager.sh
 ```
+
+Script bisa dipanggil dari mana saja (`sudo /opt/postgres/postgres-manager.sh`);
+folder kerja selalu mengikuti lokasi file script, dan ditampilkan di bagian
+atas menu.
+
+Catatan:
+
+-   Gunakan satu folder untuk satu instance. Dua folder berbeda = dua
+    instance terpisah (pastikan nama container dan port berbeda).
+-   Nama folder hanya boleh berisi huruf, angka, `.`, `_`, `-`, dan `/`.
+-   Folder sistem seperti `/`, `/usr`, `/etc`, `/var`, `/tmp`, `/root`, `/home`
+    ditolak.
+-   Owner dan permission folder proyek sendiri tidak diubah; yang diatur hanya
+    file/subfolder yang dibuat script.
+-   `.gitignore` di repo sudah mengecualikan semua file runtime (password,
+    private key, data, backup), sehingga folder clone aman untuk `git pull`.
+-   Contoh path di dokumentasi ini memakai `/opt/postgres`; sesuaikan dengan
+    folder Anda.
 
 Script harus dijalankan sebagai `root`, sehingga gunakan `sudo` jika
 masuk sebagai user biasa.
@@ -136,22 +165,23 @@ Script kemudian:
     tertipu server sementara saat inisialisasi).
 9.  Mencabut hak `CONNECT` dari `PUBLIC` pada database awal dan `postgres`.
 
-**Perlindungan data:** setup dibatalkan jika `/opt/postgres/compose.yaml`
+**Perlindungan data:** setup dibatalkan jika `compose.yaml`
 atau `.env` sudah ada, jika folder `data/` tidak kosong, atau jika nama
 container sudah dipakai. Script tidak menimpa konfigurasi/cluster yang
 sudah ada.
 
-> Jika Anda sebelumnya menyiapkan `/opt/postgres` secara manual (mis. dengan
-> `chown -R $USER /opt/postgres`), kembalikan kepemilikan ke root:
-> `sudo chown -R root:root /opt/postgres/.env /opt/postgres/compose.yaml`.
-> Script menampilkan peringatan di menu jika file ini bisa ditulis user lain.
+> `.env` dan `compose.yaml` harus milik root dan tidak bisa ditulis user lain,
+> karena dipakai oleh perintah yang berjalan sebagai root. Script menampilkan
+> peringatan di menu jika tidak demikian, atau jika folder proyek bisa ditulis
+> user lain (group/other writable).
 
 ## Struktur direktori
 
-Setelah setup berhasil, direktori yang digunakan:
+Setelah setup berhasil, isi folder proyek (contoh `/opt/postgres`):
 
 ``` text
 /opt/postgres/
+├── postgres-manager.sh
 ├── .env
 ├── compose.yaml
 ├── data/
@@ -185,7 +215,8 @@ Permission penting yang diterapkan:
 
 -   `/opt/postgres/.env`: `600`.
 -   `/opt/postgres/compose.yaml`: `600`.
--   Direktori `/opt/postgres`, sertifikat, dan backup: `700`.
+-   Folder `certs/` dan `backups/`: `700`, milik root.
+-   Folder `data/`: `700`, milik user `postgres` di container (999 Debian / 70 Alpine).
 -   `pg_hba.conf`: `640`, milik user `postgres` di container.
 -   `server.key`: `600`.
 -   `server.crt`: `644`.
@@ -334,10 +365,13 @@ Hal yang perlu diperhatikan:
 2.  Memasang salinan script ke `/usr/local/sbin/postgres-manager` (root,
     `755`). Scheduler menjalankan salinan ini, bukan file di folder user,
     supaya file yang bisa diedit user biasa tidak dieksekusi sebagai root.
-3.  Membuat `qolcore-pg-backup.service` + `qolcore-pg-backup.timer` di
-    systemd (`Persistent=true`: jika server mati saat jadwal, backup
+3.  Membuat `pgm-backup-<id>.service` + `pgm-backup-<id>.timer` di
+    systemd. `<id>` diambil dari path folder proyek, mis. `/opt/postgres` →
+    `pgm-backup-opt-postgres`, jadi beberapa instance bisa punya jadwal
+    masing-masing. Unit menjalankan salinan script dengan
+    `PGM_BASE_DIR=<folder proyek>` (`Persistent=true`: jika server mati saat jadwal, backup
     dijalankan begitu server hidup). Tanpa systemd, dipakai
-    `/etc/cron.d/qolcore-pg-backup`.
+    `/etc/cron.d/pgm-backup-<id>`.
 
 Perilaku auto backup (`postgres-manager backup-auto`):
 
@@ -347,14 +381,14 @@ Perilaku auto backup (`postgres-manager backup-auto`):
 -   Retensi (lokal maupun R2) selalu menyisakan **backup terbaru tiap
     database**, walaupun sudah melewati batas hari.
 -   Jika ada langkah yang gagal, proses keluar dengan status gagal sehingga
-    terlihat di `systemctl status qolcore-pg-backup.service` / log.
+    terlihat di `systemctl status pgm-backup-opt-postgres.service` / log.
 
 Perintah manual yang berguna:
 
 ``` bash
-systemctl list-timers qolcore-pg-backup.timer       # jadwal berikutnya
-journalctl -u qolcore-pg-backup.service -n 50       # log
-sudo /usr/local/sbin/postgres-manager backup-auto   # jalankan sekarang
+systemctl list-timers pgm-backup-opt-postgres.timer       # jadwal berikutnya
+journalctl -u pgm-backup-opt-postgres.service -n 50       # log
+sudo PGM_BASE_DIR=/opt/postgres /usr/local/sbin/postgres-manager backup-auto   # jalankan sekarang
 ```
 
 > Setelah memperbarui `postgres-manager.sh`, buka menu 14 → 1 lagi agar
@@ -599,8 +633,8 @@ Sesuaikan nama container jika saat setup memilih nama yang berbeda.
 
 ## Batasan dan catatan operasional
 
--   Script mengelola satu instance/container PostgreSQL per direktori
-    `/opt/postgres`.
+-   Script mengelola satu instance/container PostgreSQL per folder proyek
+    (folder tempat script berada).
 -   Script tidak menyediakan penghapusan database/role, ganti nama role,
     rotasi sertifikat, atau pengelolaan firewall.
 -   Menu backup meminta nama database dan menggunakan role admin dari
@@ -616,7 +650,7 @@ Sesuaikan nama container jika saat setup memilih nama yang berbeda.
     yang dikenal yang dipakai.
 -   Untuk stack lama yang dibuat manual, `POSTGRES_BIND` default `127.0.0.1`
     hanya untuk tampilan; konfigurasi port sebenarnya tetap di `compose.yaml`.
--   Lindungi direktori `/opt/postgres` dan lakukan backup off-server
+-   Lindungi folder proyek dan lakukan backup off-server
     secara berkala.
 
 ## Troubleshooting

@@ -1,0 +1,16 @@
+# File runtime yang dibuat postgres-manager.sh di folder ini.
+# Berisi password, private key, data database, dan backup: JANGAN di-commit.
+.env
+.env.*
+compose.yaml
+backup.conf
+r2.conf
+.backup.lock
+.rclone-env.*
+.r2conf.*
+.r2-test.*
+.r2-delete.*
+data/
+certs/
+config/
+backups/

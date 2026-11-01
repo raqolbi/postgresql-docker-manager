@@ -4,7 +4,26 @@
 set -Euo pipefail
 umask 077   # semua file baru (backup, .env, sertifikat) default hanya bisa dibaca root
 
-BASE_DIR="/opt/postgres"
+# Semua file runtime (.env, compose.yaml, data/, certs/, backups/, ...) dibuat di
+# folder tempat script ini berada. Scheduler menjalankan salinan di
+# /usr/local/sbin dan memberi tahu foldernya lewat PGM_BASE_DIR.
+SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}")
+INSTALLED_BIN="/usr/local/sbin/postgres-manager"
+if [[ -n "${PGM_BASE_DIR:-}" ]]; then
+  BASE_DIR=$(readlink -f "$PGM_BASE_DIR")
+elif [[ "$SCRIPT_PATH" == "$INSTALLED_BIN" ]]; then
+  echo "Ini salinan untuk scheduler. Jalankan script dari folder proyeknya, atau set PGM_BASE_DIR=<folder>." >&2
+  exit 1
+else
+  BASE_DIR=$(dirname "$SCRIPT_PATH")
+fi
+if [[ ! -d "$BASE_DIR" || ! "$BASE_DIR" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
+  echo "Folder kerja tidak valid: '$BASE_DIR' (hanya huruf, angka, . _ - / dan harus sudah ada)." >&2
+  exit 1
+fi
+case "$BASE_DIR" in
+  /|/bin|/sbin|/usr|/usr/*bin|/etc|/var|/tmp|/root|/home) echo "Folder kerja '$BASE_DIR' tidak boleh dipakai. Taruh script di folder sendiri, mis. /opt/postgres." >&2; exit 1 ;;
+esac
 ENV_FILE="$BASE_DIR/.env"
 COMPOSE_FILE="$BASE_DIR/compose.yaml"
 CERT_DIR="$BASE_DIR/certs"
@@ -12,7 +31,7 @@ CONF_DIR="$BASE_DIR/config"
 HBA_FILE="$CONF_DIR/pg_hba.conf"
 BACKUP_DIR="$BASE_DIR/backups"
 
-# Run as root so the script can manage /opt/postgres and Docker.
+# Harus root agar bisa mengelola Docker, owner file data, dan scheduler.
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   echo "Jalankan dengan sudo: sudo $0"
   exit 1
@@ -62,7 +81,11 @@ load_config() {
 # File yang dibaca/dipakai root tidak boleh bisa ditulis user lain.
 check_ownership() {
   local f owner mode
-  for f in "$BASE_DIR" "$ENV_FILE" "$COMPOSE_FILE"; do
+  mode=$(stat -c '%a' "$BASE_DIR")
+  if (( (8#$mode & 8#022) != 0 )); then
+    echo "PERINGATAN: folder $BASE_DIR (mode $mode) bisa ditulis user lain. Jalankan: sudo chmod go-w $BASE_DIR"
+  fi
+  for f in "$ENV_FILE" "$COMPOSE_FILE"; do
     [[ -e "$f" ]] || continue
     owner=$(stat -c '%u' "$f"); mode=$(stat -c '%a' "$f")
     if [[ "$owner" != "0" ]] || (( (8#$mode & 8#022) != 0 )); then
@@ -215,8 +238,9 @@ setup_stack() {
   echo "PostgreSQL versi $major, uid postgres $pg_uid, PGDATA mount $data_target"
 
   mkdir -p "$BASE_DIR/data" "$BACKUP_DIR" "$CERT_DIR" "$CONF_DIR"
-  chown root:root "$BASE_DIR" "$BACKUP_DIR" "$CERT_DIR" "$CONF_DIR"
-  chmod 700 "$BASE_DIR" "$BACKUP_DIR" "$CERT_DIR"
+  # Folder proyek sendiri tidak diubah owner/mode-nya (bisa jadi repo git milik user).
+  chown root:root "$BACKUP_DIR" "$CERT_DIR" "$CONF_DIR"
+  chmod 700 "$BACKUP_DIR" "$CERT_DIR"
   chmod 755 "$CONF_DIR"
   # Folder data di-mount ke /var/lib/postgresql. Entrypoint image hanya meng-chown
   # subfolder PGDATA, lalu berjalan sebagai user postgres, jadi folder induk ini
@@ -408,9 +432,10 @@ BACKUP_CONF="$BASE_DIR/backup.conf"
 R2_CONF="$BASE_DIR/r2.conf"
 AUTO_DIR="$BACKUP_DIR/auto"
 DOWNLOAD_DIR="$BACKUP_DIR/downloaded"
-INSTALLED_BIN="/usr/local/sbin/postgres-manager"
-SYSTEMD_UNIT="qolcore-pg-backup"
-CRON_FILE="/etc/cron.d/qolcore-pg-backup"
+# Nama unit/cron unik per folder proyek, mis. /opt/postgres -> pgm-backup-opt-postgres
+SCHED_ID=$(printf '%s' "${BASE_DIR#/}" | tr -c 'A-Za-z0-9' '-' | sed -E 's/-+/-/g; s/^-|-$//g')
+SYSTEMD_UNIT="pgm-backup-${SCHED_ID}"
+CRON_FILE="/etc/cron.d/pgm-backup-${SCHED_ID}"
 RCLONE_IMAGE_DEFAULT="rclone/rclone:1.68.2"
 
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }
@@ -876,20 +901,21 @@ schedule_enable() {
 
   # Scheduler menjalankan SALINAN script milik root, bukan file di folder user,
   # supaya file yang bisa diedit user biasa tidak pernah dieksekusi sebagai root.
-  install -o root -g root -m 0755 "$(readlink -f "$0")" "$INSTALLED_BIN"
+  install -o root -g root -m 0755 "$SCRIPT_PATH" "$INSTALLED_BIN"
   echo "Script dipasang ke $INSTALLED_BIN"
 
   if has_systemd; then
     rm -f -- "$CRON_FILE"
     cat > "/etc/systemd/system/$SYSTEMD_UNIT.service" <<EOF
 [Unit]
-Description=QolCore PostgreSQL auto backup
+Description=PostgreSQL auto backup ($BASE_DIR)
 After=docker.service network-online.target
 Wants=network-online.target
 Requires=docker.service
 
 [Service]
 Type=oneshot
+Environment=PGM_BASE_DIR=$BASE_DIR
 ExecStart=$INSTALLED_BIN backup-auto
 Nice=10
 IOSchedulingClass=best-effort
@@ -897,7 +923,7 @@ IOSchedulingPriority=7
 EOF
     cat > "/etc/systemd/system/$SYSTEMD_UNIT.timer" <<EOF
 [Unit]
-Description=Jadwal QolCore PostgreSQL auto backup
+Description=Jadwal PostgreSQL auto backup ($BASE_DIR)
 
 [Timer]
 OnCalendar=*-*-* $hh:$mm:00
@@ -917,7 +943,7 @@ EOF
 # Dibuat oleh postgres-manager
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-$((10#$mm)) $((10#$hh)) * * * root $INSTALLED_BIN backup-auto >> $AUTO_DIR/backup.log 2>&1
+$((10#$mm)) $((10#$hh)) * * * root PGM_BASE_DIR=$BASE_DIR $INSTALLED_BIN backup-auto >> $AUTO_DIR/backup.log 2>&1
 EOF
     chmod 644 "$CRON_FILE"
     echo "Cron aktif setiap hari jam $t, tujuan: $(target_label "$tg") (log: $AUTO_DIR/backup.log)"
@@ -1353,6 +1379,7 @@ main_menu() {
     echo "=============================================="
     echo "        POSTGRESQL DOCKER MANAGER"
     echo "=============================================="
+    echo "Folder   : $BASE_DIR"
     if [[ -f "$ENV_FILE" ]] && load_config 2>/dev/null; then
       echo "Container: $POSTGRES_CONTAINER | Bind: $POSTGRES_BIND:$POSTGRES_PORT"
       check_ownership
