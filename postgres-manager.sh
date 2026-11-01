@@ -30,6 +30,7 @@ load_config() {
   [[ -f "$ENV_FILE" ]] || { err "File $ENV_FILE tidak ditemukan. Jalankan setup (menu 1) terlebih dahulu."; return 1; }
   POSTGRES_IMAGE="" POSTGRES_DB="" POSTGRES_USER="" POSTGRES_PASSWORD=""
   POSTGRES_PORT="" POSTGRES_BIND="" POSTGRES_CONTAINER="" POSTGRES_DATA_TARGET=""
+  POSTGRES_UID="" POSTGRES_GID=""
   local key value
   while IFS='=' read -r key value || [[ -n "$key" ]]; do
     key=${key//$'\r'/}; value=${value//$'\r'/}
@@ -41,6 +42,8 @@ load_config() {
     case "$key" in
       POSTGRES_IMAGE|POSTGRES_DB|POSTGRES_USER|POSTGRES_PASSWORD|POSTGRES_PORT|POSTGRES_BIND|POSTGRES_CONTAINER|POSTGRES_DATA_TARGET)
         printf -v "$key" '%s' "$value" ;;
+      POSTGRES_UID|POSTGRES_GID)
+        if [[ "$value" =~ ^[0-9]+$ ]]; then printf -v "$key" '%s' "$value"; fi ;;
     esac
   done < "$ENV_FILE"
   : "${POSTGRES_IMAGE:=postgres:18}"
@@ -215,6 +218,11 @@ setup_stack() {
   chown root:root "$BASE_DIR" "$BACKUP_DIR" "$CERT_DIR" "$CONF_DIR"
   chmod 700 "$BASE_DIR" "$BACKUP_DIR" "$CERT_DIR"
   chmod 755 "$CONF_DIR"
+  # Folder data di-mount ke /var/lib/postgresql. Entrypoint image hanya meng-chown
+  # subfolder PGDATA, lalu berjalan sebagai user postgres, jadi folder induk ini
+  # harus milik user postgres di container (bukan root 700).
+  chown "$pg_uid:$pg_gid" "$BASE_DIR/data"
+  chmod 700 "$BASE_DIR/data"
 
   echo "Membuat self-signed SSL certificate..."
   openssl req -new -x509 -days 3650 -nodes -newkey rsa:2048 \
@@ -252,6 +260,8 @@ POSTGRES_PORT=$port
 POSTGRES_BIND=$bind
 POSTGRES_CONTAINER=$container
 POSTGRES_DATA_TARGET=$data_target
+POSTGRES_UID=$pg_uid
+POSTGRES_GID=$pg_gid
 EOF
   chmod 600 "$ENV_FILE"
 
@@ -1173,10 +1183,39 @@ show_logs() {
   docker logs --tail 100 -f "$POSTGRES_CONTAINER" || true
 }
 
+# Pastikan folder data milik user postgres di container. Memperbaiki instalasi yang
+# dibuat versi script lama (folder data root 700 -> "mkdir: Permission denied").
+# Return 0 = sudah benar, 10 = baru diperbaiki.
+ensure_data_dir_owner() {
+  local dir="$BASE_DIR/data" uid=${POSTGRES_UID:-} gid=${POSTGRES_GID:-}
+  [[ -d "$dir" ]] || return 0
+  if [[ -z "$uid" ]]; then
+    uid=$(docker run --rm --entrypoint id "$POSTGRES_IMAGE" -u postgres 2>/dev/null || true)
+    gid=$(docker run --rm --entrypoint id "$POSTGRES_IMAGE" -g postgres 2>/dev/null || true)
+    [[ "$uid" =~ ^[0-9]+$ ]] || { err "Tidak bisa membaca UID postgres dari image $POSTGRES_IMAGE."; return 1; }
+    [[ "$gid" =~ ^[0-9]+$ ]] || gid=$uid
+    env_set POSTGRES_UID "$uid"; env_set POSTGRES_GID "$gid"
+  fi
+  [[ -n "$gid" ]] || gid=$uid
+  if [[ "$(stat -c '%u' "$dir")" != "$uid" ]]; then
+    echo "Memperbaiki owner $dir -> $uid:$gid (user postgres di container)"
+    chown "$uid:$gid" "$dir" && chmod 700 "$dir" || { err "Gagal mengubah owner $dir."; return 1; }
+    return 10
+  fi
+  return 0
+}
+
 start_stack() {
   load_config || return 1
   check_docker || return 1
-  (cd "$BASE_DIR" && docker compose up -d) || return 1
+  local fixed=0
+  ensure_data_dir_owner || { (( $? == 10 )) && fixed=1 || return 1; }
+  if (( fixed )); then
+    # Container lama mungkin sedang restart-loop; buat ulang agar langsung mencoba lagi.
+    (cd "$BASE_DIR" && docker compose up -d --force-recreate) || return 1
+  else
+    (cd "$BASE_DIR" && docker compose up -d) || return 1
+  fi
   echo "Menunggu PostgreSQL siap..."
   wait_ready "$POSTGRES_CONTAINER" "$POSTGRES_USER" "$POSTGRES_DB" && echo "PostgreSQL siap." || { err "PostgreSQL belum siap. Periksa logs."; return 1; }
 }

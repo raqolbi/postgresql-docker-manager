@@ -629,6 +629,22 @@ Pastikan Docker Compose plugin tersedia:
 docker compose version
 ```
 
+### `mkdir: cannot create directory '/var/lib/postgresql': Permission denied`
+
+Terjadi pada setup dengan versi script lama: folder `/opt/postgres/data`
+dibuat milik `root` dengan mode `700`, padahal entrypoint image PostgreSQL 18
+berjalan sebagai user `postgres` (uid 999 untuk image Debian, 70 untuk
+Alpine) dan harus bisa masuk ke folder itu.
+
+Perbaikan: jalankan versi script terbaru lalu pilih menu **2. Start
+PostgreSQL**. Script otomatis mengubah owner folder `data/` ke user postgres
+di container dan membuat ulang container. Cara manual:
+
+``` bash
+sudo chown 999:999 /opt/postgres/data && sudo chmod 700 /opt/postgres/data
+cd /opt/postgres && sudo docker compose up -d --force-recreate
+```
+
 ### Container tidak berjalan atau PostgreSQL belum siap
 
 Periksa status dan log:
