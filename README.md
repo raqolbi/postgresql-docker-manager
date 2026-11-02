@@ -168,6 +168,14 @@ Script kemudian:
     tertipu server sementara saat inisialisasi).
 9.  Mencabut hak `CONNECT` dari `PUBLIC` pada database awal dan `postgres`.
 
+**Login admin dari luar:** admin adalah superuser. Secara default, setup
+menambahkan aturan `pg_hba` yang **menolak** login admin lewat TCP; admin hanya
+bisa dipakai dari dalam container (script selalu memakai socket lokal).
+Aplikasi dan tool seperti DBeaver sebaiknya memakai user per database (menu 5).
+Jika memang perlu admin dari luar, jawab `y` pada pertanyaan "Izinkan admin
+login dari luar container" saat setup (atau hapus dua baris `reject` untuk admin
+di `config/pg_hba.conf` lalu restart).
+
 **Perlindungan data:** setup dibatalkan jika `compose.yaml`
 atau `.env` sudah ada, jika folder `data/` tidak kosong, atau jika nama
 container sudah dipakai. Script tidak menimpa konfigurasi/cluster yang
@@ -359,6 +367,9 @@ Hal yang perlu diperhatikan:
 -   **Backup terbaru tiap database selalu disimpan**, walaupun umurnya sudah
     lewat batas. Contoh: database yang sudah tidak di-backup lagi tetap
     menyisakan satu backup terakhirnya.
+-   Mode **lokal + R2**: jika upload ke R2 gagal, retensi lokal **dilewati**
+    pada run itu, supaya backup lama yang mungkin belum sampai ke R2 tidak
+    terhapus. Retensi berjalan lagi setelah upload berhasil.
 -   Retensi **hanya** berlaku untuk backup otomatis. Backup manual (menu 6),
     backup pengaman sebelum restore, folder `manual/` di R2, dan file di
     `backups/downloaded/` **tidak pernah dihapus otomatis**, jadi bisa tetap
@@ -443,7 +454,9 @@ qolcore-backup/
 
 -   Memakai **rclone** dengan image Docker terkunci versi
     (`rclone/rclone:1.68.2`), jadi tidak perlu memasang apa pun di host. Jika
-    rclone sudah ada di host, script menawarkan untuk memakainya.
+    rclone versi 1.59+ sudah ada di host, script menawarkan untuk memakainya
+    (versi lama tidak mengenal provider Cloudflare, sehingga tetap memakai
+    container).
 -   Kredensial dikirim lewat env-file sementara (`600`, langsung dihapus),
     tidak pernah muncul di argumen proses (`ps`).
 -   `no_check_bucket` aktif sehingga token cukup berizin Object Read & Write
@@ -654,7 +667,10 @@ Isi pesan: status (✅/❌), host, folder, container, ringkasan per database,
 status upload R2, baris error, dan peringatan sertifikat jika ada.
 
 -   Disimpan di `telegram.conf` (root, `600`). Token dikirim ke `curl` lewat
-    stdin sehingga tidak muncul di `ps`. Butuh `curl` dan `python3` di host.
+    stdin sehingga tidak muncul di `ps`. Butuh `curl` (script memberi tahu
+    jika belum terpasang) dan `python3` (untuk pencarian chat otomatis) di host.
+-   Saat mengubah pengaturan, ketik `-` pada pertanyaan chat ID untuk memakai
+    chat ID yang sudah tersimpan.
 -   Gagal mengirim notifikasi **tidak** mengubah status backup.
 -   Menu 14 → 9 mengirim pesan tes, 14 → 10 mematikan notifikasi.
 
@@ -711,10 +727,11 @@ Auto backup berjalan sebagai **root** dan menulis ke folder proyek. Karena itu:
 PostgreSQL dijalankan dengan SSL aktif menggunakan sertifikat
 self-signed yang dibuat saat setup.
 
-Contoh connection string:
+Contoh connection string (user aplikasi dari menu 5; admin hanya jika login
+TCP admin diizinkan saat setup):
 
 ``` text
-postgresql://qolcore_owner:PASSWORD@HOST:5434/qolcore?sslmode=require
+postgresql://nama_user:PASSWORD@HOST:5434/nama_database?sslmode=require
 ```
 
 `sslmode=require` mengenkripsi koneksi, tetapi tidak memverifikasi

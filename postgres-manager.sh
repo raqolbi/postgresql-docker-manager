@@ -195,7 +195,7 @@ setup_stack() {
     return 1
   fi
 
-  local image db admin password port bind container confirm major pg_uid data_target force_ssl
+  local image db admin password port bind container confirm major pg_uid data_target force_ssl admin_tcp
   read -r -p "Image PostgreSQL [postgres:18]: " image
   image=${image:-postgres:18}
   [[ "$image" =~ ^[A-Za-z0-9._/:@-]+$ ]] || { err "Nama image tidak valid."; return 1; }
@@ -226,6 +226,10 @@ setup_stack() {
   fi
   read -r -p "Wajibkan SSL untuk semua koneksi TCP (tolak koneksi non-SSL)? [Y/n]: " force_ssl
   force_ssl=${force_ssl:-Y}
+  echo "Admin '$admin' adalah superuser. Script selalu memakai socket lokal di dalam container."
+  echo "Aplikasi sebaiknya memakai user per database (menu 5), bukan superuser."
+  read -r -p "Izinkan admin login dari luar container (TCP, mis. dari DBeaver)? [y/N]: " admin_tcp
+  admin_tcp=${admin_tcp:-N}
 
   echo ""
   echo "Pilih password admin:"
@@ -283,6 +287,11 @@ setup_stack() {
     echo "# Dibuat oleh postgres-manager.sh"
     echo "# TYPE     DATABASE  USER  ADDRESS     METHOD"
     echo "local      all       all               trust"
+    if [[ "${admin_tcp,,}" != "y" ]]; then
+      echo "# Superuser admin hanya boleh lewat socket lokal (docker exec)."
+      echo "host       all       $admin   0.0.0.0/0   reject"
+      echo "host       all       $admin   ::/0        reject"
+    fi
     if [[ "${force_ssl,,}" == "n" ]]; then
       echo "host       all       all   0.0.0.0/0   scram-sha-256"
       echo "host       all       all   ::/0        scram-sha-256"
@@ -377,8 +386,13 @@ SQL
   echo "SSL       : aktif (self-signed certificate)$([[ "${force_ssl,,}" == "n" ]] || echo ", koneksi non-SSL ditolak")"
   echo "Password  : tersimpan di $ENV_FILE (permission 600)"
   echo ""
-  echo "Connection string (sesuaikan host):"
-  echo "postgresql://$admin:<PASSWORD>@<HOST>:$port/$db?sslmode=require"
+  if [[ "${admin_tcp,,}" == "y" ]]; then
+    echo "Connection string admin (sesuaikan host):"
+    echo "postgresql://$admin:<PASSWORD>@<HOST>:$port/$db?sslmode=require"
+  else
+    echo "Admin hanya bisa login dari dalam container (TCP ditolak)."
+    echo "Buat database + user untuk aplikasi lewat menu 5; connection string-nya ditampilkan di sana."
+  fi
   firewall_notice "$bind" "$port"
 }
 
@@ -722,8 +736,15 @@ EOF
   [[ "$ret" =~ ^[0-9]+$ ]] || { err "Retensi harus angka."; return 1; }
   engine=${R2_RCLONE:-docker}
   if [[ "$engine" == "docker" ]] && command -v rclone >/dev/null 2>&1; then
-    read -r -p "rclone terpasang di host. Pakai rclone host, bukan container? [y/N]: " ret2
-    [[ "${ret2,,}" == "y" ]] && engine=host
+    local rv rmaj rmin
+    rv=$(rclone version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+' | head -n1 || true)
+    rmaj=${rv%%.*}; rmin=${rv#*.}
+    if [[ "$rv" =~ ^[0-9]+\.[0-9]+$ ]] && (( rmaj > 1 || (rmaj == 1 && rmin >= 59) )); then
+      read -r -p "rclone $rv terpasang di host. Pakai rclone host, bukan container? [y/N]: " ret2
+      [[ "${ret2,,}" == "y" ]] && engine=host
+    else
+      echo "Catatan: rclone di host (versi ${rv:-?}) terlalu lama untuk R2 (butuh 1.59+); dipakai container rclone."
+    fi
   fi
 
   local tmp; tmp=$(mktemp "$BASE_DIR/.r2conf.XXXXXX")
@@ -834,7 +855,7 @@ prune_backups() {
 
 # Dipanggil oleh scheduler: `postgres-manager backup-auto`. Non-interaktif.
 backup_auto() {
-  local db failed=0 ok=0 dbs=()
+  local db failed=0 ok=0 dbs=() upload_ok=1
   # Kunci pada folder itu sendiri (dibuka read-only): tidak ada file lock yang bisa
   # dibelokkan lewat symlink untuk menimpa file lain sebagai root.
   exec 9<"$BASE_DIR"
@@ -845,7 +866,7 @@ backup_auto() {
   load_backup_conf
   if [[ "$BACKUP_TARGET" != "local" ]] && ! r2_configured; then
     err "Target '$BACKUP_TARGET' butuh R2, tetapi $R2_CONF belum lengkap. Backup tetap disimpan lokal."
-    failed=1
+    failed=1; upload_ok=0
   fi
   if [[ "$BACKUP_DATABASES" == "all" ]]; then
     mapfile -t dbs < <(list_app_databases)
@@ -865,9 +886,11 @@ backup_auto() {
 
   # Upload dulu, baru retensi lokal: file yang belum ter-upload tidak dihapus duluan.
   if [[ "$BACKUP_TARGET" != "local" ]] && r2_configured; then
+    upload_ok=0
     local mode=copy
     [[ "$BACKUP_TARGET" == "r2" ]] && mode=move
     if r2_sync_auto "$mode"; then
+      upload_ok=1
       log "Upload R2 berhasil."
       r2_prune "$R2_RETENTION_DAYS" || failed=1
     else
@@ -876,7 +899,11 @@ backup_auto() {
     fi
   fi
   # Retensi lokal hanya kalau ada backup baru yang berhasil.
-  if (( ok > 0 )); then prune_backups "$BACKUP_RETENTION_DAYS"; fi
+  if (( ok > 0 )) && (( upload_ok )); then
+    prune_backups "$BACKUP_RETENTION_DAYS"
+  elif (( ok > 0 )); then
+    log "Retensi lokal dilewati: upload R2 gagal, backup lokal lama disimpan sampai berhasil ter-upload."
+  fi
   if (( failed == 0 )); then
     log "Auto backup selesai: $ok database OK"
   else
@@ -1136,6 +1163,7 @@ for cid, (t, n) in seen.items():
 
 tg_configure() {
   load_tg_conf || true
+  command -v curl >/dev/null 2>&1 || { err "curl belum terpasang di server. Pasang dulu (mis. sudo apt install curl), lalu ulangi."; return 1; }
   local token chat mode resp botname rows=() r i pick
   cat <<'EOF'
 === Notifikasi Telegram ===
@@ -1177,7 +1205,11 @@ EOF
   while true; do
     echo
     echo "Pastikan langkah 2 sudah dilakukan (kirim pesan ke @${botname:-bot} / /start@${botname:-bot} di grup)."
-    read -r -p "Tekan Enter untuk mencari chat, atau ketik chat ID manual${TG_CHAT_ID:+ [tersimpan: $TG_CHAT_ID]}: " chat
+    if [[ -n "$TG_CHAT_ID" ]]; then
+      read -r -p "Enter = cari chat otomatis | ketik chat ID manual | '-' = pakai yang tersimpan ($TG_CHAT_ID): " chat
+    else
+      read -r -p "Enter = cari chat otomatis | atau ketik chat ID manual: " chat
+    fi
     [[ -z "$chat" ]] || break
     mapfile -t rows < <(tg_find_chats "$token")
     if (( ${#rows[@]} > 0 )) && [[ "${rows[0]}" == ERR* ]]; then
@@ -1205,7 +1237,7 @@ EOF
     fi
     echo "Pilihan tidak valid."
   done
-  [[ "$chat" == "-" ]] && chat=$TG_CHAT_ID
+  if [[ "$chat" == "-" ]]; then chat=$TG_CHAT_ID; fi
   [[ "$chat" =~ ^(-?[0-9]+|@[A-Za-z0-9_]{5,})$ ]] || { err "Chat ID tidak valid (angka; grup/channel diawali -100; atau @namachannel)."; return 1; }
 
   echo
