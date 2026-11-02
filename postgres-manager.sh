@@ -1137,12 +1137,12 @@ load_profile() {
     [[ "$line" == *=* && "$line" != \#* ]] || continue
     key=${line%%=*}; value=${line#*=}
     case "$key" in
-      R_HOST)      if [[ "$value" =~ ^[A-Za-z0-9._:-]{1,253}$ ]]; then R_HOST=$value; fi ;;
+      R_HOST)      if [[ "$value" =~ ^[A-Za-z0-9:][A-Za-z0-9._:-]{0,252}$ ]]; then R_HOST=$value; fi ;;
       R_PORT)      if [[ "$value" =~ ^[0-9]{1,5}$ ]]; then R_PORT=$value; fi ;;
       R_USER)      if [[ "$value" =~ ^[A-Za-z0-9_.@-]{1,128}$ ]]; then R_USER=$value; fi ;;
       R_PASSWORD)  R_PASSWORD=$value ;;
       R_SSLMODE)   if [[ " $REMOTE_SSL_MODES " == *" $value "* ]]; then R_SSLMODE=$value; fi ;;
-      R_CA)        if [[ -z "$value" || "$value" == system || -f "$value" ]]; then R_CA=$value; fi ;;
+      R_CA)        if [[ -z "$value" || "$value" == system || "$value" =~ ^/[^:,]+$ ]]; then R_CA=$value; fi ;;
       R_MAINTDB)   if valid_dbname "$value"; then R_MAINTDB=$value; fi ;;
       R_DATABASES) if [[ "$value" == all || "$value" =~ ^[A-Za-z0-9_\$-]+(,[A-Za-z0-9_\$-]+)*$ ]]; then R_DATABASES=$value; fi ;;
       R_AUTO)      if [[ "$value" == yes || "$value" == no ]]; then R_AUTO=$value; fi ;;
@@ -1204,8 +1204,12 @@ rprofile_edit() {
   read -r -p "Nama profil (huruf kecil/angka/-/_, mis. neon-prod): " name
   valid_profile "$name" || { err "Nama profil tidak valid."; return 1; }
   if [[ -f "$REMOTE_DIR/$name.conf" ]]; then
-    load_profile "$name" || return 1
-    echo "Mengubah profil '$name'. Kosongkan isian untuk memakai nilai lama."
+    if load_profile "$name" 2>/dev/null; then
+      echo "Mengubah profil '$name'. Kosongkan isian untuk memakai nilai lama."
+    else
+      R_NAME=$name
+      echo "Profil '$name' tidak lengkap/rusak; lengkapi isian di bawah untuk memperbaikinya."
+    fi
   else
     isnew=1
     R_NAME=$name R_HOST="" R_PORT="5432" R_USER="" R_PASSWORD="" R_SSLMODE="require" R_CA=""
@@ -1222,7 +1226,7 @@ database). Untuk restore: hak membuat/menghapus objek di database tujuan.
 Server tujuan harus bisa dijangkau dari server ini (cek firewall/allowlist IP).
 EOF
   read -r -p "Host (domain/IP) [${R_HOST}]: " v; v=${v:-$R_HOST}
-  [[ "$v" =~ ^[A-Za-z0-9._:-]{1,253}$ ]] || { err "Host tidak valid."; return 1; }
+  [[ "$v" =~ ^[A-Za-z0-9:][A-Za-z0-9._:-]{0,252}$ ]] || { err "Host tidak valid."; return 1; }
   R_HOST=$v
   read -r -p "Port [${R_PORT}]: " v; v=${v:-$R_PORT}
   [[ "$v" =~ ^[0-9]{1,5}$ ]] && (( 10#$v >= 1 && 10#$v <= 65535 )) || { err "Port tidak valid."; return 1; }
@@ -1239,13 +1243,21 @@ EOF
   [[ -n "$R_PASSWORD" ]] || { err "Password wajib diisi."; return 1; }
   echo "Mode SSL: $REMOTE_SSL_MODES"
     echo "  disable=tanpa SSL | require=terenkripsi, tanpa verifikasi | verify-ca=cek CA |"
-  echo "  verify-full=cek CA + nama host (paling aman). CA 'system' = CA bawaan OS (butuh klien PostgreSQL 16+)."
+  echo "  verify-full=cek CA + nama host (paling aman; file CA kosong = CA bawaan OS)."
   read -r -p "Mode SSL [${R_SSLMODE}]: " v; v=${v:-$R_SSLMODE}
   [[ " $REMOTE_SSL_MODES " == *" $v "* ]] || { err "Mode SSL tidak dikenal."; return 1; }
   R_SSLMODE=$v
-  read -r -p "File CA untuk verifikasi (kosong = tidak ada${R_CA:+, '-' = hapus}; 'system' = CA bawaan OS) [${R_CA}]: " v
+  if [[ "${v,,}" == disable* ]]; then
+    echo "PERINGATAN: tanpa SSL, isi database (termasuk hasil backup) lewat jaringan tanpa enkripsi."
+    echo "            Pakai hanya untuk jaringan privat/VPN."
+  fi
+  read -r -p "File CA (kosong/'system' = CA bawaan OS, cocok untuk layanan managed${R_CA:+; '-' = hapus}) [${R_CA}]: " v
   if [[ "$v" == "-" ]]; then R_CA=""; elif [[ -n "$v" ]]; then
-    if [[ "$v" != system ]]; then v=$(expand_path "$v"); [[ -r "$v" ]] || { err "File CA tidak bisa dibaca: $v"; return 1; }; fi
+    if [[ "$v" != system ]]; then
+      v=$(expand_path "$v"); [[ -r "$v" && -f "$v" ]] || { err "File CA tidak bisa dibaca: $v"; return 1; }
+      v=$(readlink -f -- "$v")
+      [[ "$v" =~ ^/[^:,]+$ ]] || { err "Path file CA tidak boleh mengandung ':' atau ','; pindahkan filenya."; return 1; }
+    fi
     R_CA=$v
   fi
     read -r -p "Database untuk koneksi awal (postgres; Neon: neondb) [${R_MAINTDB}]: " v; v=${v:-$R_MAINTDB}
@@ -1439,21 +1451,38 @@ rc_exec() {
   local mode=$1 image=$2 tool=$3; shift 3
   local -a envs=(PGHOST="$R_HOST" PGPORT="$R_PORT" PGUSER="$R_USER" PGSSLMODE="$R_SSLMODE"
                  PGCONNECT_TIMEOUT=15 PGAPPNAME=qolcore-backup)
+  rc_ca_file || return 1
   if [[ "$mode" == host ]]; then
-    [[ -n "$R_CA" ]] && envs+=(PGSSLROOTCERT="$R_CA")
+    if [[ -n "$RC_CA_FILE" ]]; then envs+=(PGSSLROOTCERT="$RC_CA_FILE"); fi
     PGPASSWORD="$R_PASSWORD" env "${envs[@]}" "$tool" "$@"
   else
     local -a dargs=(--rm -i --network host -e PGPASSWORD)
     local e
     for e in "${envs[@]}"; do dargs+=(-e "$e"); done
-    if [[ "$R_CA" == system ]]; then
-      dargs+=(-e PGSSLROOTCERT=system)
-    elif [[ -n "$R_CA" ]]; then
-      dargs+=(-v "$R_CA:/tmp/remote-ca.pem:ro" -e PGSSLROOTCERT=/tmp/remote-ca.pem)
+    if [[ -n "$RC_CA_FILE" ]]; then
+      dargs+=(-v "$RC_CA_FILE:/tmp/remote-ca.pem:ro" -e PGSSLROOTCERT=/tmp/remote-ca.pem)
     fi
     ensure_image "$image" || return 1
     PGPASSWORD="$R_PASSWORD" docker run "${dargs[@]}" --entrypoint "$tool" "$image" "$@"
   fi
+}
+
+# File CA efektif untuk koneksi -> RC_CA_FILE (kosong = tanpa CA).
+# Mode verifikasi tanpa file CA / dengan 'system' memakai bundle CA OS di host
+# (di-mount ke container), sehingga berlaku sama untuk klien host maupun Docker.
+rc_ca_file() {
+  RC_CA_FILE=""
+  if [[ -n "$R_CA" && "$R_CA" != system ]]; then
+    [[ -r "$R_CA" ]] || { err "File CA profil '$R_NAME' tidak ditemukan / tidak bisa dibaca: $R_CA"; return 1; }
+    RC_CA_FILE=$R_CA; return 0
+  fi
+  case "${R_SSLMODE,,}" in verify*) ;; *) return 0 ;; esac
+  local f
+  for f in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/ca-bundle.pem /etc/ssl/cert.pem; do
+    if [[ -r "$f" ]]; then RC_CA_FILE=$(readlink -f -- "$f"); return 0; fi
+  done
+  err "Bundle CA sistem tidak ditemukan (pasang paket ca-certificates) atau isi file CA di profil."
+  return 1
 }
 
 # Pastikan image klien tersedia (pull senyap), supaya pesan pull tidak tercampur output.
@@ -1474,11 +1503,12 @@ rc_probe_client() {
   fi
 }
 
-rc_psql() { rc_probe_client; rc_exec "$PROBE_MODE" "$PROBE_IMAGE" psql -X -v ON_ERROR_STOP=1 "$@"; }
+rc_psql() { rc_probe_client; rc_exec "$PROBE_MODE" "$PROBE_IMAGE" psql -X -v ON_ERROR_STOP=1 "$@" < /dev/null; }
 
 # Cek koneksi & baca versi server -> RS_VERSION, RS_MAJOR.
 rb_probe() {
   local out num errf
+  rc_ca_file || return 1
   errf=$(mktemp)
   if ! out=$(rc_psql -d "$R_MAINTDB" -tAc "SELECT current_setting('server_version_num') || ' ' || version()" 2>"$errf"); then
     err "Gagal terhubung ke $R_HOST:$R_PORT sebagai $R_USER: $(grep -m1 -iE 'error|fatal|could not' "$errf" || head -n1 "$errf")"
@@ -1536,6 +1566,7 @@ rb_db_exists() {
 # Backup satu database profil aktif ke <dir>/<db>-YYYYMMDD-HHMMSS.dump. Mencetak path.
 rb_backup_db() {
   local db=$1 dir=$2 ts file tmp
+  valid_dbname "$db" || { err "Remote $R_NAME: nama database '$db' tidak didukung (hanya huruf, angka, _ \$ -); dilewati."; return 1; }
   [[ -n "$RS_MAJOR" ]] || rb_probe >/dev/null || return 1
   [[ -n "$RC_MODE" ]] || rc_select "$RS_MAJOR" || return 1
   mkdir -p "$dir"; chmod 700 "$dir"
@@ -1575,8 +1606,11 @@ rb_restore_remote() {
   echo "Server tujuan: $R_NAME ($R_USER@$R_HOST:$R_PORT) - $RS_VERSION"
   # Versi pg_dump pembuat file menentukan versi pg_restore minimal.
   rc_select "$RS_MAJOR" || return 1
-  dumpver=$(rc_run pg_restore -l < "$file" 2>/dev/null | sed -nE 's/^;[[:space:]]+Dumped by pg_dump version: ([0-9]+).*/\1/p' | head -n1)
-  [[ -n "$dumpver" ]] || { err "File bukan arsip pg_dump yang valid, atau dibuat oleh pg_dump yang lebih baru dari klien."; return 1; }
+  dumpver=$(rc_run pg_restore -l < "$file" 2>/dev/null | sed -nE 's/^;[[:space:]]+Dumped by pg_dump version: ([0-9]+).*/\1/p' | head -n1 || true)
+  if [[ -z "$dumpver" && "$R_CLIENT" != host && "$RC_IMAGE" != "$PG_PROBE_IMAGE" ]]; then
+    dumpver=$(rc_exec docker "$PG_PROBE_IMAGE" pg_restore -l < "$file" 2>/dev/null | sed -nE 's/^;[[:space:]]+Dumped by pg_dump version: ([0-9]+).*/\1/p' | head -n1 || true)
+  fi
+  [[ -n "$dumpver" ]] || { err "File bukan arsip pg_dump format custom (-Fc) yang valid."; return 1; }
   need=$RS_MAJOR
   if [[ "$RS_MAJOR" != *.* ]] && (( dumpver > RS_MAJOR )); then
     need=$dumpver
@@ -2154,7 +2188,8 @@ collect_backups() {
         fi
       done
     fi
-  } | awk -F'|' '!($5 in best) || ($2 ~ /^lokal/ && src[$5] !~ /^lokal/) { best[$5] = $0; src[$5] = $2 }
+  } | awk -F'|' '{ n = split($2, a, ":"); p = ($2 ~ /^lokal/) ? (n > 1 ? a[2] : "") : (n > 2 ? a[3] : ""); k = p "/" $5 }
+                 !(k in best) || ($2 ~ /^lokal/ && src[k] !~ /^lokal/) { best[k] = $0; src[k] = $2 }
                  END { for (k in best) print best[k] }' | sort -t'|' -k1,1nr
 }
 

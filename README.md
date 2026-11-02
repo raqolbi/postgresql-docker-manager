@@ -700,7 +700,8 @@ Setelah disimpan, koneksi langsung dites: versi server, apakah koneksi
 terenkripsi, klien yang akan dipakai, dan daftar database yang terlihat.
 
 - **Database awal**: database untuk koneksi awal (default `postgres`; Neon: `neondb`).
-- **Mode SSL**: `disable`, `require` (default), `verify-ca`, `verify-full`. File CA bisa berupa path file, atau `system` untuk CA bawaan OS (klien PostgreSQL 16+; cocok untuk Neon).
+- **Mode SSL**: `disable`, `require` (default), `verify-ca`, `verify-full`. File CA bisa berupa path file; pada mode `verify-*`, file CA kosong atau `system` memakai bundle CA bawaan OS (cocok untuk Neon dan layanan managed lain).
+- **Nama database**: database remote yang namanya mengandung karakter selain huruf, angka, `_`, `$`, `-` dilewati (dicatat gagal), supaya nama dari server tidak bisa dipakai untuk menulis file di luar folder backup atau disisipkan sebagai opsi klien.
 - **Hak akses user backup**: CONNECT ke database + SELECT ke semua tabel/sequence (paling mudah: owner database). Backup role memakai `pg_dumpall --globals-only --no-role-passwords` dan dilewati otomatis jika tidak ada hak.
 - Server harus bisa dijangkau dari server ini (firewall, allowlist IP di
   layanan managed).
