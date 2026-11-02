@@ -647,19 +647,19 @@ r2_upload_files() {
 # SETELAH upload terverifikasi). File yang gagal di-upload tetap di lokal dan dicoba
 # lagi pada run berikutnya.
 r2_sync_auto() {
-  local mode=$1
-  [[ -d "$AUTO_DIR" ]] || return 0
-  log "R2 $mode: $AUTO_DIR -> $(r2_path auto)"
-  rclone_run "$mode" "$AUTO_DIR" "$(r2_path auto)" \
+  local mode=$1 dir=${2:-$AUTO_DIR} sub=${3:-auto}
+  [[ -d "$dir" ]] || return 0
+  log "R2 $mode: $dir -> $(r2_path "$sub")"
+  rclone_run "$mode" "$dir" "$(r2_path "$sub")" \
     --include '*.dump' --include 'globals-*.sql' --max-depth 1
 }
 
 # Retensi di R2: hapus objek di auto/ yang lebih tua dari N hari, tapi selalu sisakan
 # objek terbaru per database dan file globals terbaru.
 r2_prune() {
-  local days=${1:-0} listing cutoff list_file name ts epoch key
+  local days=${1:-0} sub=${2:-auto} listing cutoff list_file name ts epoch key
   (( days > 0 )) || return 0
-  listing=$(rclone_run lsf "$(r2_path auto)" --files-only --format "tp" --separator ";" 2>/dev/null) || { err "Gagal membaca daftar objek R2."; return 1; }
+  listing=$(rclone_run lsf "$(r2_path "$sub")" --files-only --format "tp" --separator ";" 2>/dev/null) || { err "Gagal membaca daftar objek R2."; return 1; }
   [[ -n "$listing" ]] || return 0
   cutoff=$(( $(date +%s) - days * 86400 ))
   declare -A newest_ts=() newest_name=()
@@ -683,13 +683,12 @@ r2_prune() {
   done
   if (( count > 0 )); then
     log "R2: hapus $count backup lama (> $days hari)"
-    rclone_run delete "$(r2_path auto)" --files-from-raw "$list_file" --max-depth 1 || { rm -f -- "$list_file"; return 1; }
+    rclone_run delete "$(r2_path "$sub")" --files-from-raw "$list_file" --max-depth 1 || { rm -f -- "$list_file"; return 1; }
   fi
   rm -f -- "$list_file"
 }
 
 r2_configure() {
-  load_config || return 1
   load_r2_conf || true
   local acc key secret bucket prefix endpoint ret ret2="" engine
   cat <<'EOF'
@@ -832,25 +831,25 @@ target_label() {
 # Hapus backup otomatis lokal yang lebih tua dari N hari, tapi SELALU sisakan file
 # terbaru tiap database (supaya tidak pernah habis walau backup sempat gagal lama).
 prune_backups() {
-  local days=$1 db f newest dbs=()
+  local days=$1 dir=${2:-$AUTO_DIR} db f newest dbs=()
   (( days > 0 )) || return 0
-  [[ -d "${AUTO_DIR:?}" ]] || return 0
-  find "${AUTO_DIR:?}" -maxdepth 1 -type f -name '*.partial' -mmin +360 -delete 2>/dev/null || true
-  mapfile -t dbs < <(find "${AUTO_DIR:?}" -maxdepth 1 -type f -name '*.dump' -printf '%f\n' \
+  [[ -d "${dir:?}" ]] || return 0
+  find "${dir:?}" -maxdepth 1 -type f -name '*.partial' -mmin +360 -delete 2>/dev/null || true
+  mapfile -t dbs < <(find "${dir:?}" -maxdepth 1 -type f -name '*.dump' -printf '%f\n' \
                      | sed -E 's/-[0-9]{8}-[0-9]{6}(-[0-9]+)?\.dump$//' | sort -u)
   for db in "${dbs[@]}"; do
     valid_dbname "$db" || continue
-    newest=$(find "${AUTO_DIR:?}" -maxdepth 1 -type f -name "${db}-*.dump" -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)
+    newest=$(find "${dir:?}" -maxdepth 1 -type f -name "${db}-*.dump" -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)
     while IFS= read -r f; do
       [[ -n "$f" && "$f" != "$newest" ]] || continue
       rm -f -- "$f" && log "Hapus backup lama: $f"
-    done < <(find "${AUTO_DIR:?}" -maxdepth 1 -type f -name "${db}-*.dump" -mmin +"$((days * 1440))")
+    done < <(find "${dir:?}" -maxdepth 1 -type f -name "${db}-*.dump" -mmin +"$((days * 1440))")
   done
-  newest=$(find "${AUTO_DIR:?}" -maxdepth 1 -type f -name 'globals-*.sql' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)
+  newest=$(find "${dir:?}" -maxdepth 1 -type f -name 'globals-*.sql' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)
   while IFS= read -r f; do
     [[ -n "$f" && "$f" != "$newest" ]] || continue
     rm -f -- "$f"
-  done < <(find "${AUTO_DIR:?}" -maxdepth 1 -type f -name 'globals-*.sql' -mmin +"$((days * 1440))")
+  done < <(find "${dir:?}" -maxdepth 1 -type f -name 'globals-*.sql' -mmin +"$((days * 1440))")
 }
 
 # Dipanggil oleh scheduler: `postgres-manager backup-auto`. Non-interaktif.
@@ -861,38 +860,55 @@ backup_auto() {
   exec 9<"$BASE_DIR"
   flock -n 9 || { err "Backup lain sedang berjalan; dilewati."; return 1; }
   base_dir_safe || return 1
-  load_config || return 1
-  container_running || { err "Container '$POSTGRES_CONTAINER' tidak berjalan."; return 1; }
   load_backup_conf
+  # Instance lokal opsional: manager bisa dipakai murni untuk backup server remote.
+  local local_on=0
+  if [[ -f "$ENV_FILE" ]]; then
+    if load_config && container_running; then
+      local_on=1
+    else
+      err "Instance lokal tidak berjalan; backup lokal dilewati."; failed=1
+    fi
+  fi
   if [[ "$BACKUP_TARGET" != "local" ]] && ! r2_configured; then
     err "Target '$BACKUP_TARGET' butuh R2, tetapi $R2_CONF belum lengkap. Backup tetap disimpan lokal."
     failed=1; upload_ok=0
   fi
-  if [[ "$BACKUP_DATABASES" == "all" ]]; then
-    mapfile -t dbs < <(list_app_databases)
-  else
-    IFS=',' read -r -a dbs <<< "$BACKUP_DATABASES"
-  fi
-  (( ${#dbs[@]} > 0 )) || { err "Tidak ada database untuk di-backup (atau gagal membaca daftar database)."; return 1; }
-  log "Auto backup mulai: ${dbs[*]} (target: $(target_label "$BACKUP_TARGET"))"
-  for db in "${dbs[@]}"; do
-    [[ -n "$db" ]] || continue
-    if ! valid_dbname "$db" || ! db_exists "$db"; then
-      err "Database '$db' tidak ditemukan; dilewati."; failed=1; continue
+  if (( local_on )); then
+    if [[ "$BACKUP_DATABASES" == "all" ]]; then
+      mapfile -t dbs < <(list_app_databases)
+    else
+      IFS=',' read -r -a dbs <<< "$BACKUP_DATABASES"
     fi
-    if do_backup "$db" "$AUTO_DIR" >/dev/null; then ok=$((ok+1)); else failed=1; fi
-  done
-  do_globals "$AUTO_DIR" >/dev/null || failed=1
+    if (( ${#dbs[@]} == 0 )); then err "Instance lokal: tidak ada database untuk di-backup (atau gagal membaca daftar database)."; failed=1; fi
+    log "Auto backup mulai: ${dbs[*]} (target: $(target_label "$BACKUP_TARGET"))"
+    for db in "${dbs[@]}"; do
+      [[ -n "$db" ]] || continue
+      if ! valid_dbname "$db" || ! db_exists "$db"; then
+        err "Database '$db' tidak ditemukan; dilewati."; failed=1; continue
+      fi
+      if do_backup "$db" "$AUTO_DIR" >/dev/null; then ok=$((ok+1)); else failed=1; fi
+    done
+    do_globals "$AUTO_DIR" >/dev/null || failed=1
+  fi
+  # Profil server remote dengan auto: yes.
+  remote_auto_backup || failed=1
+  ok=$((ok + RA_OK))
+  if (( ! local_on )) && (( RA_PROFILES == 0 )); then
+    err "Tidak ada yang di-backup: instance lokal belum di-setup/berjalan dan tidak ada profil remote dengan auto: yes."
+    return 1
+  fi
 
   # Upload dulu, baru retensi lokal: file yang belum ter-upload tidak dihapus duluan.
   if [[ "$BACKUP_TARGET" != "local" ]] && r2_configured; then
     upload_ok=0
     local mode=copy
     [[ "$BACKUP_TARGET" == "r2" ]] && mode=move
-    if r2_sync_auto "$mode"; then
+    if r2_sync_auto "$mode" && remote_r2_sync "$mode"; then
       upload_ok=1
       log "Upload R2 berhasil."
       r2_prune "$R2_RETENTION_DAYS" || failed=1
+      remote_r2_prune "$R2_RETENTION_DAYS" || failed=1
     else
       err "Upload ke R2 gagal; file tetap disimpan lokal dan akan dicoba lagi pada run berikutnya."
       failed=1
@@ -901,6 +917,7 @@ backup_auto() {
   # Retensi lokal hanya kalau ada backup baru yang berhasil.
   if (( ok > 0 )) && (( upload_ok )); then
     prune_backups "$BACKUP_RETENTION_DAYS"
+    remote_prune "$BACKUP_RETENTION_DAYS"
   elif (( ok > 0 )); then
     log "Retensi lokal dilewati: upload R2 gagal, backup lokal lama disimpan sampai berhasil ter-upload."
   fi
@@ -928,6 +945,10 @@ schedule_status() {
   else
     echo "Telegram    : belum dikonfigurasi"
   fi
+  local rp=() p n=0
+  mapfile -t rp < <(list_profiles)
+  for p in "${rp[@]}"; do load_profile "$p" 2>/dev/null && [[ "$R_AUTO" == yes ]] && n=$((n+1)); done
+  echo "Remote      : ${#rp[@]} profil, $n ikut auto backup (menu server remote)"
   echo "Folder lokal: $AUTO_DIR"
   if has_systemd && systemctl is-enabled "$SYSTEMD_UNIT.timer" >/dev/null 2>&1; then
     echo "Scheduler   : systemd timer AKTIF"
@@ -945,7 +966,7 @@ schedule_status() {
 }
 
 schedule_enable() {
-  load_config || return 1
+  load_config 2>/dev/null || true
   load_backup_conf
   local t r d hh mm tg
   read -r -p "Jam backup harian (HH:MM, zona waktu server) [$BACKUP_TIME]: " t; t=${t:-$BACKUP_TIME}
@@ -1080,6 +1101,519 @@ schedule_menu() {
     10) tg_disable ;;
     *) return 0 ;;
   esac
+}
+
+# ---------------------------------------------------------------------------
+# SERVER REMOTE: backup & restore server PostgreSQL di luar instance lokal ini
+# ---------------------------------------------------------------------------
+REMOTE_DIR="$BASE_DIR/remotes"          # profil koneksi: remotes/<nama>.conf (root, 600)
+RBACKUP_DIR="$BACKUP_DIR/remote"        # backup manual/pengaman: backups/remote/<profil>/
+RAUTO_DIR="$AUTO_DIR/remote"            # auto backup: backups/auto/remote/<profil>/
+REMOTE_SSL_MODES="disable require verify-ca verify-full"
+
+valid_profile() { [[ "$1" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]]; }
+
+list_profiles() {
+  local f
+  [[ -d "$REMOTE_DIR" ]] || return 0
+  for f in "$REMOTE_DIR"/*.conf; do
+    [[ -f "$f" ]] || continue
+    f=$(basename "$f" .conf)
+    valid_profile "$f" && printf '%s\n' "$f"
+  done
+}
+
+# Baca profil sebagai data (tidak di-source). Password disimpan apa adanya (tanpa trim).
+load_profile() {
+  local name=$1 f key value
+  R_NAME="" R_HOST="" R_PORT="5432" R_USER="" R_PASSWORD="" R_SSLMODE="require" R_CA=""
+  R_MAINTDB="postgres" R_DATABASES="all" R_AUTO="no" R_CLIENT="auto"
+  valid_profile "$name" || { err "Nama profil tidak valid: '$name'"; return 1; }
+  f="$REMOTE_DIR/$name.conf"
+  [[ -f "$f" ]] || { err "Profil '$name' tidak ditemukan."; return 1; }
+  R_NAME=$name
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=${line%$'\r'}
+    [[ "$line" == *=* && "$line" != \#* ]] || continue
+    key=${line%%=*}; value=${line#*=}
+    case "$key" in
+      R_HOST)      if [[ "$value" =~ ^[A-Za-z0-9._:-]{1,253}$ ]]; then R_HOST=$value; fi ;;
+      R_PORT)      if [[ "$value" =~ ^[0-9]{1,5}$ ]]; then R_PORT=$value; fi ;;
+      R_USER)      if [[ "$value" =~ ^[A-Za-z0-9_.@-]{1,128}$ ]]; then R_USER=$value; fi ;;
+      R_PASSWORD)  R_PASSWORD=$value ;;
+      R_SSLMODE)   if [[ " $REMOTE_SSL_MODES " == *" $value "* ]]; then R_SSLMODE=$value; fi ;;
+      R_CA)        if [[ -z "$value" || "$value" == system || -f "$value" ]]; then R_CA=$value; fi ;;
+      R_MAINTDB)   if valid_dbname "$value"; then R_MAINTDB=$value; fi ;;
+      R_DATABASES) if [[ "$value" == all || "$value" =~ ^[A-Za-z0-9_\$-]+(,[A-Za-z0-9_\$-]+)*$ ]]; then R_DATABASES=$value; fi ;;
+      R_AUTO)      if [[ "$value" == yes || "$value" == no ]]; then R_AUTO=$value; fi ;;
+      R_CLIENT)    if [[ "$value" == auto || "$value" == host || "$value" == docker ]]; then R_CLIENT=$value; fi ;;
+    esac
+  done < "$f"
+  [[ -n "$R_HOST" && -n "$R_USER" ]] || { err "Profil '$name' tidak lengkap (host/user)."; return 1; }
+  RC_MODE="" RC_IMAGE="" RS_VERSION="" RS_MAJOR="" RC_EXTRA_DONE=""
+}
+
+save_profile() {
+  local name=$1 tmp
+  mkdir -p "$REMOTE_DIR"; chown root:root "$REMOTE_DIR"; chmod 700 "$REMOTE_DIR"
+  tmp=$(mktemp "$REMOTE_DIR/.profile.XXXXXX")
+  {
+    printf 'R_HOST=%s\nR_PORT=%s\nR_USER=%s\n' "$R_HOST" "$R_PORT" "$R_USER"
+    printf 'R_PASSWORD=%s\n' "$R_PASSWORD"
+    printf 'R_SSLMODE=%s\nR_CA=%s\nR_MAINTDB=%s\n' "$R_SSLMODE" "$R_CA" "$R_MAINTDB"
+    printf 'R_DATABASES=%s\nR_AUTO=%s\nR_CLIENT=%s\n' "$R_DATABASES" "$R_AUTO" "$R_CLIENT"
+  } > "$tmp"
+  chmod 600 "$tmp"; chown root:root "$tmp"; mv -f "$tmp" "$REMOTE_DIR/$name.conf"
+}
+
+# Pilih profil secara interaktif; hasil di variabel PICKED_PROFILE.
+pick_profile() {
+  local -a ps=(); local p i=0 pick
+  mapfile -t ps < <(list_profiles)
+  (( ${#ps[@]} > 0 )) || { err "Belum ada profil server remote. Tambahkan lewat menu 'Tambah / ubah profil'."; return 1; }
+  for p in "${ps[@]}"; do
+    i=$((i+1))
+    if load_profile "$p" 2>/dev/null; then
+      printf '  %d. %-16s %s@%s:%s  (db: %s, auto: %s)\n' "$i" "$p" "$R_USER" "$R_HOST" "$R_PORT" "$R_DATABASES" "$R_AUTO"
+    else
+      printf '  %d. %-16s (profil rusak)\n' "$i" "$p"
+    fi
+  done
+  read -r -p "${1:-Pilih profil}: " pick
+  [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#ps[@]} )) || { err "Pilihan tidak valid."; return 1; }
+  PICKED_PROFILE=${ps[$((pick-1))]}
+  load_profile "$PICKED_PROFILE"
+}
+
+rprofile_list() {
+  local -a ps=(); local p
+  mapfile -t ps < <(list_profiles)
+  (( ${#ps[@]} > 0 )) || { echo "Belum ada profil server remote."; return 0; }
+  printf '%-16s %-34s %-16s %-14s %-5s %s\n' "PROFIL" "SERVER" "SSL" "DATABASE" "AUTO" "KLIEN"
+  for p in "${ps[@]}"; do
+    if load_profile "$p" 2>/dev/null; then
+      printf '%-16s %-34s %-16s %-14s %-5s %s\n' "$p" "$R_USER@$R_HOST:$R_PORT" "$R_SSLMODE" "$R_DATABASES" "$R_AUTO" "$R_CLIENT"
+    else
+      printf '%-16s %s\n' "$p" "(profil rusak; ubah atau hapus)"
+    fi
+  done
+}
+
+rprofile_edit() {
+  local name pw pw2 v isnew=0 choices
+  read -r -p "Nama profil (huruf kecil/angka/-/_, mis. neon-prod): " name
+  valid_profile "$name" || { err "Nama profil tidak valid."; return 1; }
+  if [[ -f "$REMOTE_DIR/$name.conf" ]]; then
+    load_profile "$name" || return 1
+    echo "Mengubah profil '$name'. Kosongkan isian untuk memakai nilai lama."
+  else
+    isnew=1
+    R_NAME=$name R_HOST="" R_PORT="5432" R_USER="" R_PASSWORD="" R_SSLMODE="require" R_CA=""
+    R_MAINTDB="postgres" R_DATABASES="all" R_AUTO="no" R_CLIENT="auto"
+  fi
+    cat <<'EOF'
+Contoh:
+  - Neon     : host ep-xxxx-xxxx.ap-southeast-1.aws.neon.tech, port 5432, user neondb_owner,
+               SSL verify-full + CA 'system' (atau require), database awal neondb.
+               Pakai host TANPA "-pooler" (pg_dump tidak cocok lewat PgBouncer).
+  - Server lain / RDS / Cloud SQL: host & port server, SSL require (atau verify-full + file CA).
+Hak akses user: CONNECT ke database + SELECT ke semua tabel/sequence (paling mudah: owner
+database). Untuk restore: hak membuat/menghapus objek di database tujuan.
+Server tujuan harus bisa dijangkau dari server ini (cek firewall/allowlist IP).
+EOF
+  read -r -p "Host (domain/IP) [${R_HOST}]: " v; v=${v:-$R_HOST}
+  [[ "$v" =~ ^[A-Za-z0-9._:-]{1,253}$ ]] || { err "Host tidak valid."; return 1; }
+  R_HOST=$v
+  read -r -p "Port [${R_PORT}]: " v; v=${v:-$R_PORT}
+  [[ "$v" =~ ^[0-9]{1,5}$ ]] && (( 10#$v >= 1 && 10#$v <= 65535 )) || { err "Port tidak valid."; return 1; }
+  R_PORT=$((10#$v))
+  read -r -p "Username [${R_USER}]: " v; v=${v:-$R_USER}
+  [[ "$v" =~ ^[A-Za-z0-9_.@-]{1,128}$ ]] || { err "Username tidak valid."; return 1; }
+  R_USER=$v
+  read -r -s -p "Password${R_PASSWORD:+ (kosong = pakai yang tersimpan)}: " pw; echo
+  if [[ -n "$pw" ]]; then
+    read -r -s -p "Ulangi password: " pw2; echo
+    [[ "$pw" == "$pw2" ]] || { err "Password tidak cocok."; return 1; }
+    R_PASSWORD=$pw
+  fi
+  [[ -n "$R_PASSWORD" ]] || { err "Password wajib diisi."; return 1; }
+  echo "Mode SSL: $REMOTE_SSL_MODES"
+    echo "  disable=tanpa SSL | require=terenkripsi, tanpa verifikasi | verify-ca=cek CA |"
+  echo "  verify-full=cek CA + nama host (paling aman). CA 'system' = CA bawaan OS (butuh klien PostgreSQL 16+)."
+  read -r -p "Mode SSL [${R_SSLMODE}]: " v; v=${v:-$R_SSLMODE}
+  [[ " $REMOTE_SSL_MODES " == *" $v "* ]] || { err "Mode SSL tidak dikenal."; return 1; }
+  R_SSLMODE=$v
+  read -r -p "File CA untuk verifikasi (kosong = tidak ada${R_CA:+, '-' = hapus}; 'system' = CA bawaan OS) [${R_CA}]: " v
+  if [[ "$v" == "-" ]]; then R_CA=""; elif [[ -n "$v" ]]; then
+    if [[ "$v" != system ]]; then v=$(expand_path "$v"); [[ -r "$v" ]] || { err "File CA tidak bisa dibaca: $v"; return 1; }; fi
+    R_CA=$v
+  fi
+    read -r -p "Database untuk koneksi awal (postgres; Neon: neondb) [${R_MAINTDB}]: " v; v=${v:-$R_MAINTDB}
+  valid_dbname "$v" || { err "Nama database tidak valid."; return 1; }
+  R_MAINTDB=$v
+  read -r -p "Database yang di-backup: 'all' atau daftar dipisah koma [${R_DATABASES}]: " v; v=${v:-$R_DATABASES}; v=${v// /}
+  [[ "$v" == all || "$v" =~ ^[A-Za-z0-9_\$-]+(,[A-Za-z0-9_\$-]+)*$ ]] || { err "Daftar database tidak valid."; return 1; }
+  R_DATABASES=$v
+  read -r -p "Ikut auto backup terjadwal (menu auto backup)? yes/no [${R_AUTO}]: " v; v=${v:-$R_AUTO}
+  [[ "$v" == yes || "$v" == no ]] || { err "Isi yes atau no."; return 1; }
+  R_AUTO=$v
+  echo "Klien dump: auto = pakai klien di host jika versinya cocok, selain itu container Docker."
+  read -r -p "Klien (auto/host/docker) [${R_CLIENT}]: " v; v=${v:-$R_CLIENT}
+  [[ "$v" == auto || "$v" == host || "$v" == docker ]] || { err "Pilihan klien tidak valid."; return 1; }
+  R_CLIENT=$v
+  save_profile "$name"
+  echo "Profil '$name' $( (( isnew )) && echo dibuat || echo diperbarui ) di $REMOTE_DIR/$name.conf (permission 600)."
+  load_profile "$name" && rb_test
+}
+
+rprofile_delete() {
+  local confirm
+  pick_profile "Pilih profil yang dihapus" || return 1
+  read -r -p "Ketik nama profil ($PICKED_PROFILE) untuk menghapus profil (file backup tidak ikut dihapus): " confirm
+  [[ "$confirm" == "$PICKED_PROFILE" ]] || { echo "Dibatalkan."; return 0; }
+  rm -f -- "$REMOTE_DIR/$PICKED_PROFILE.conf"
+  echo "Profil '$PICKED_PROFILE' dihapus. Backup di $RBACKUP_DIR/$PICKED_PROFILE dan $RAUTO_DIR/$PICKED_PROFILE tetap ada."
+}
+
+rprofile_test() { pick_profile "Pilih profil yang dites" || return 1; rb_test; }
+
+# Daftar database yang di-backup untuk profil aktif (R_DATABASES atau semua yang terlihat).
+profile_db_list() {
+  if [[ "$R_DATABASES" == all ]]; then
+    rb_list_dbs
+  else
+    tr ',' '\n' <<< "$R_DATABASES"
+  fi
+}
+
+remote_backup_now() {
+  local db file failed=0 up dbs=() files=() d dir
+  pick_profile "Pilih profil yang di-backup" || return 1
+  rb_probe || return 1
+  echo "Database di server ini:"
+  rb_list_dbs | sed 's/^/  - /'
+  read -r -p "Database yang di-backup (kosong = sesuai profil: $R_DATABASES): " db
+  if [[ -n "$db" ]]; then
+    valid_dbname "$db" || { err "Nama database tidak valid."; return 1; }
+    dbs=("$db")
+  else
+    mapfile -t dbs < <(profile_db_list)
+  fi
+  (( ${#dbs[@]} > 0 )) || { err "Tidak ada database untuk di-backup."; return 1; }
+  dir="$RBACKUP_DIR/$R_NAME"
+  for d in "${dbs[@]}"; do
+    [[ -n "$d" ]] || continue
+    if file=$(rb_backup_db "$d" "$dir"); then echo "OK    $file ($(du -h "$file" | cut -f1))"; files+=("$file"); else echo "GAGAL $d"; failed=1; fi
+  done
+  if file=$(rb_backup_globals "$dir"); then files+=("$file"); fi
+  if (( ${#files[@]} > 0 )) && r2_configured; then
+    read -r -p "Upload juga ke R2 (folder manual/remote/$R_NAME/)? [y/N]: " up
+    if [[ "${up,,}" == "y" ]]; then
+      if r2_upload_files "manual/remote/$R_NAME" "${files[@]}"; then echo "Upload ke R2 selesai."; else err "Upload ke R2 gagal; file lokal tetap ada."; failed=1; fi
+    fi
+  fi
+  (( failed == 0 ))
+}
+
+remote_restore_now() {
+  local file rc t confirm
+  echo "Pilih file backup (backup lokal, remote, dan R2 ditampilkan semua)."
+  rc=0; file=$(pick_backup) || rc=$?
+  (( rc != 2 )) || { echo "Dibatalkan."; return 0; }
+  (( rc == 0 )) || return 1
+  [[ -f "$file" && -r "$file" ]] || { err "File tidak ditemukan / tidak bisa dibaca: $file"; return 1; }
+  echo "File: $file"
+  echo
+  echo "Restore ke mana?"
+  echo "  0. Instance PostgreSQL lokal di server ini (yang dikelola script ini)"
+  echo "  atau pilih profil server remote:"
+  local -a ps=(); local p i=0
+  mapfile -t ps < <(list_profiles)
+  for p in "${ps[@]}"; do i=$((i+1)); printf '  %d. %s\n' "$i" "$p"; done
+  read -r -p "Tujuan: " t
+  if [[ "$t" == 0 ]]; then
+    [[ -f "$ENV_FILE" ]] || { err "Instance lokal belum di-setup (menu 1)."; return 1; }
+    restore_database "$file"
+    return $?
+  fi
+  [[ "$t" =~ ^[0-9]+$ ]] && (( t >= 1 && t <= ${#ps[@]} )) || { err "Pilihan tidak valid."; return 1; }
+  load_profile "${ps[$((t-1))]}" || return 1
+  rb_restore_remote "$file"
+}
+
+# Dipanggil dari backup_auto: backup semua profil dengan R_AUTO=yes ke $RAUTO_DIR/<profil>/.
+# Mengisi RA_PROFILES (jumlah profil) dan RA_OK (jumlah database berhasil).
+remote_auto_backup() {
+  local p d failed=0 dbs=()
+  RA_PROFILES=0 RA_OK=0
+  local -a ps=()
+  mapfile -t ps < <(list_profiles)
+  for p in "${ps[@]}"; do
+    load_profile "$p" 2>/dev/null || { err "Profil remote '$p' rusak; dilewati."; failed=1; continue; }
+    [[ "$R_AUTO" == yes ]] || continue
+    RA_PROFILES=$((RA_PROFILES+1))
+    log "Remote '$p' ($R_USER@$R_HOST:$R_PORT): mulai"
+    if ! rb_probe >/dev/null; then err "Remote '$p': tidak bisa terhubung."; failed=1; continue; fi
+    mapfile -t dbs < <(profile_db_list)
+    (( ${#dbs[@]} > 0 )) || { err "Remote '$p': tidak ada database."; failed=1; continue; }
+    for d in "${dbs[@]}"; do
+      [[ -n "$d" ]] || continue
+      valid_dbname "$d" || { err "Remote '$p': nama database tidak valid '$d'."; failed=1; continue; }
+      if rb_backup_db "$d" "$RAUTO_DIR/$p" >/dev/null; then RA_OK=$((RA_OK+1)); else failed=1; fi
+    done
+    rb_backup_globals "$RAUTO_DIR/$p" >/dev/null || true
+  done
+  return "$failed"
+}
+
+remote_auto_dirs() {
+  local d
+  [[ -d "$RAUTO_DIR" ]] || return 0
+  for d in "$RAUTO_DIR"/*/; do
+    [[ -d "$d" ]] || continue
+    d=${d%/}
+    valid_profile "$(basename "$d")" && printf '%s\n' "$d"
+  done
+}
+
+remote_r2_sync() {
+  local mode=$1 d rc=0
+  while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+    r2_sync_auto "$mode" "$d" "auto/remote/$(basename "$d")" || rc=1
+  done < <(remote_auto_dirs)
+  return "$rc"
+}
+
+remote_r2_prune() {
+  local days=$1 d rc=0
+  while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+    r2_prune "$days" "auto/remote/$(basename "$d")" || rc=1
+  done < <(remote_auto_dirs)
+  return "$rc"
+}
+
+remote_prune() {
+  local days=$1 d
+  while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+    prune_backups "$days" "$d"
+  done < <(remote_auto_dirs)
+}
+
+remote_menu() {
+  local c
+  echo "=== Server remote: backup & restore PostgreSQL ==="
+  echo "Untuk server PostgreSQL di luar instance lokal (mis. VPS lain, layanan managed)."
+  echo "Instance lokal tidak wajib di-setup untuk memakai menu ini."
+  echo
+  rprofile_list
+  echo
+  echo "  1. Tambah / ubah profil server"
+  echo "  2. Tes koneksi profil"
+  echo "  3. Backup sekarang"
+  echo "  4. Restore (ke server remote atau instance lokal)"
+  echo "  5. Hapus profil"
+  echo "  0. Kembali"
+  echo "Auto backup terjadwal untuk profil dengan 'auto: yes' berjalan bersama jadwal di menu auto backup."
+  read -r -p "Pilihan: " c
+  case "$c" in
+    1) rprofile_edit ;;
+    2) rprofile_test ;;
+    3) remote_backup_now ;;
+    4) remote_restore_now ;;
+    5) rprofile_delete ;;
+    *) return 0 ;;
+  esac
+}
+
+# --- Bagian khusus PostgreSQL ------------------------------------------------
+# Klien: pg_dump/pg_restore di host jika versinya >= server, selain itu container
+# postgres:<versi server> (pg_dump wajib sama atau lebih baru dari server).
+PG_PROBE_IMAGE="postgres:18"
+
+# Jalankan alat klien PostgreSQL ke server profil aktif.
+# rc_exec <host|docker> <image> <tool> [args...]; stdin/stdout diteruskan.
+rc_exec() {
+  local mode=$1 image=$2 tool=$3; shift 3
+  local -a envs=(PGHOST="$R_HOST" PGPORT="$R_PORT" PGUSER="$R_USER" PGSSLMODE="$R_SSLMODE"
+                 PGCONNECT_TIMEOUT=15 PGAPPNAME=qolcore-backup)
+  if [[ "$mode" == host ]]; then
+    [[ -n "$R_CA" ]] && envs+=(PGSSLROOTCERT="$R_CA")
+    PGPASSWORD="$R_PASSWORD" env "${envs[@]}" "$tool" "$@"
+  else
+    local -a dargs=(--rm -i --network host -e PGPASSWORD)
+    local e
+    for e in "${envs[@]}"; do dargs+=(-e "$e"); done
+    if [[ "$R_CA" == system ]]; then
+      dargs+=(-e PGSSLROOTCERT=system)
+    elif [[ -n "$R_CA" ]]; then
+      dargs+=(-v "$R_CA:/tmp/remote-ca.pem:ro" -e PGSSLROOTCERT=/tmp/remote-ca.pem)
+    fi
+    ensure_image "$image" || return 1
+    PGPASSWORD="$R_PASSWORD" docker run "${dargs[@]}" --entrypoint "$tool" "$image" "$@"
+  fi
+}
+
+# Pastikan image klien tersedia (pull senyap), supaya pesan pull tidak tercampur output.
+ensure_image() {
+  docker image inspect "$1" >/dev/null 2>&1 && return 0
+  echo "Mengunduh image klien $1 ..." >&2
+  docker pull -q "$1" >/dev/null 2>&1 || { err "Gagal mengunduh image $1."; return 1; }
+}
+
+host_pg_major() { command -v "$1" >/dev/null 2>&1 || return 1; "$1" --version 2>/dev/null | grep -oE '[0-9]+' | head -n1; }
+
+# Klien untuk perintah ringan (psql): host jika ada, selain itu container terbaru.
+rc_probe_client() {
+  if [[ "$R_CLIENT" != docker ]] && command -v psql >/dev/null 2>&1; then
+    PROBE_MODE=host PROBE_IMAGE=""
+  else
+    PROBE_MODE=docker PROBE_IMAGE=$PG_PROBE_IMAGE
+  fi
+}
+
+rc_psql() { rc_probe_client; rc_exec "$PROBE_MODE" "$PROBE_IMAGE" psql -X -v ON_ERROR_STOP=1 "$@"; }
+
+# Cek koneksi & baca versi server -> RS_VERSION, RS_MAJOR.
+rb_probe() {
+  local out num errf
+  errf=$(mktemp)
+  if ! out=$(rc_psql -d "$R_MAINTDB" -tAc "SELECT current_setting('server_version_num') || ' ' || version()" 2>"$errf"); then
+    err "Gagal terhubung ke $R_HOST:$R_PORT sebagai $R_USER: $(grep -m1 -iE 'error|fatal|could not' "$errf" || head -n1 "$errf")"
+    rm -f -- "$errf"; return 1
+  fi
+  rm -f -- "$errf"
+  num=$(awk 'NR==1{print $1}' <<< "$out")
+  [[ "$num" =~ ^[0-9]+$ ]] || { err "Respons server tidak dikenali: $out"; return 1; }
+  RS_VERSION=$(cut -d' ' -f2- <<< "$out" | head -n1)
+  if (( num >= 100000 )); then RS_MAJOR=$(( num / 10000 )); else RS_MAJOR="$(( num / 10000 )).$(( num / 100 % 100 ))"; fi
+}
+
+# Pilih klien untuk pg_dump/pg_restore minimal versi <need> (major).
+rc_select() {
+  local need=$1 hv
+  hv=$(host_pg_major pg_dump || true)
+  case "$R_CLIENT" in
+    host)
+      [[ -n "$hv" ]] || { err "pg_dump tidak terpasang di host (klien profil = host)."; return 1; }
+      [[ "$need" == *.* ]] || (( hv >= need )) || echo "Peringatan: pg_dump host versi $hv lebih lama dari server ($need); dump bisa gagal." >&2
+      RC_MODE=host RC_IMAGE="" ;;
+    docker) RC_MODE=docker RC_IMAGE="postgres:$need" ;;
+    *)
+      if [[ -n "$hv" ]] && { [[ "$need" == *.* ]] || (( hv >= need )); }; then RC_MODE=host RC_IMAGE=""
+      else RC_MODE=docker RC_IMAGE="postgres:$need"; fi ;;
+  esac
+}
+
+rc_run() { rc_exec "$RC_MODE" "$RC_IMAGE" "$@"; }
+
+rb_test() {
+  echo "Tes koneksi ke $R_USER@$R_HOST:$R_PORT (SSL: $R_SSLMODE)..."
+  rb_probe || return 1
+  echo "Terhubung. Server: $RS_VERSION"
+  rc_select "$RS_MAJOR" || return 1
+  echo "Klien dump: $([[ "$RC_MODE" == host ]] && echo "pg_dump di host ($(host_pg_major pg_dump))" || echo "container $RC_IMAGE")"
+  local ssl
+  ssl=$(rc_psql -d "$R_MAINTDB" -tAc "SELECT CASE WHEN ssl THEN 'ya (' || version || ')' ELSE 'TIDAK' END FROM pg_stat_ssl WHERE pid = pg_backend_pid()" 2>/dev/null | head -n1)
+  echo "Koneksi terenkripsi: ${ssl:-tidak diketahui}"
+  echo "Database yang bisa di-backup:"
+  rb_list_dbs | sed 's/^/  - /'
+}
+
+rb_list_dbs() {
+  rc_psql -d "$R_MAINTDB" -tAc "SELECT datname FROM pg_database WHERE NOT datistemplate AND datallowconn
+    AND has_database_privilege(datname, 'CONNECT')
+    AND datname NOT IN ('postgres','azure_maintenance','azure_sys','rdsadmin','cloudsqladmin','_dodb')
+    ORDER BY datname"
+}
+
+rb_db_exists() {
+  [[ "$(rc_psql -d "$R_MAINTDB" -tAc "SELECT 1 FROM pg_database WHERE datname=$(sql_literal "$1")" | tr -d '[:space:]')" == "1" ]]
+}
+
+# Backup satu database profil aktif ke <dir>/<db>-YYYYMMDD-HHMMSS.dump. Mencetak path.
+rb_backup_db() {
+  local db=$1 dir=$2 ts file tmp
+  [[ -n "$RS_MAJOR" ]] || rb_probe >/dev/null || return 1
+  [[ -n "$RC_MODE" ]] || rc_select "$RS_MAJOR" || return 1
+  mkdir -p "$dir"; chmod 700 "$dir"
+  ts=$(date +%Y%m%d-%H%M%S)
+  file="$dir/${db}-${ts}.dump"; [[ -e "$file" ]] && file="$dir/${db}-${ts}-$$.dump"
+  tmp="$file.partial"
+  log "Backup remote $R_NAME/$db -> $file"
+  if ! rc_run pg_dump -Fc -d "$db" > "$tmp"; then
+    rm -f -- "$tmp"; err "pg_dump $R_NAME/$db gagal; file parsial dihapus."; return 1
+  fi
+  if ! rc_run pg_restore -l < "$tmp" >/dev/null 2>&1; then
+    rm -f -- "$tmp"; err "File backup $R_NAME/$db tidak valid; dihapus."; return 1
+  fi
+  chmod 600 "$tmp"; mv -f "$tmp" "$file"
+  printf '%s\n' "$file"
+}
+
+# Role & atribut global. --no-role-passwords supaya jalan tanpa superuser (Neon, RDS, dll).
+rb_backup_globals() {
+  local dir=$1 file
+  [[ -n "$RC_MODE" ]] || return 1
+  mkdir -p "$dir"; chmod 700 "$dir"
+  file="$dir/globals-$(date +%Y%m%d-%H%M%S).sql"
+  if rc_run pg_dumpall --globals-only --no-role-passwords -l "$R_MAINTDB" > "$file.partial" 2>/dev/null; then
+    chmod 600 "$file.partial"; mv -f "$file.partial" "$file"; printf '%s\n' "$file"
+  else
+    rm -f -- "$file.partial"
+    log "Remote $R_NAME: backup roles dilewati (butuh hak membaca pg_roles; normal di layanan managed)."
+    return 1
+  fi
+}
+
+rb_restore_remote() {
+  local file=$1 db def_db dumpver need pre confirm c bk
+  case "$file" in *.dump) ;; *) err "Restore ke PostgreSQL butuh file .dump (pg_dump -Fc)."; return 1 ;; esac
+  rb_probe || return 1
+  echo "Server tujuan: $R_NAME ($R_USER@$R_HOST:$R_PORT) - $RS_VERSION"
+  # Versi pg_dump pembuat file menentukan versi pg_restore minimal.
+  rc_select "$RS_MAJOR" || return 1
+  dumpver=$(rc_run pg_restore -l < "$file" 2>/dev/null | sed -nE 's/^;[[:space:]]+Dumped by pg_dump version: ([0-9]+).*/\1/p' | head -n1)
+  [[ -n "$dumpver" ]] || { err "File bukan arsip pg_dump yang valid, atau dibuat oleh pg_dump yang lebih baru dari klien."; return 1; }
+  need=$RS_MAJOR
+  if [[ "$RS_MAJOR" != *.* ]] && (( dumpver > RS_MAJOR )); then
+    need=$dumpver
+    echo "PERINGATAN: backup dibuat oleh pg_dump $dumpver, server tujuan versi $RS_MAJOR."
+    echo "            Restore ke versi lebih lama bisa gagal (pengaturan/sintaks yang belum ada)."
+    read -r -p "Tetap lanjut? [y/N]: " c
+    [[ "${c,,}" == "y" ]] || { echo "Dibatalkan."; return 0; }
+    RC_MODE=""; rc_select "$need" || return 1
+  fi
+
+  def_db=$(db_from_backup_name "$file")
+  echo "Database di server tujuan:"
+  rb_list_dbs | sed 's/^/  - /'
+  read -r -p "Database tujuan${def_db:+ [$def_db]}: " db; db=${db:-$def_db}
+  valid_dbname "$db" || { err "Nama database tidak valid."; return 1; }
+  if ! rb_db_exists "$db"; then
+    read -r -p "Database '$db' belum ada di $R_NAME. Buat sekarang (butuh hak CREATEDB)? [y/N]: " c
+    [[ "${c,,}" == "y" ]] || { echo "Dibatalkan."; return 0; }
+    rc_psql -d "$R_MAINTDB" -q -c "CREATE DATABASE $(sql_ident "$db");" || { err "Gagal membuat database."; return 1; }
+  else
+    read -r -p "Backup database '$db' di $R_NAME dulu sebelum ditimpa? [Y/n]: " pre
+    if [[ "${pre,,}" != "n" ]]; then
+      bk=$(rb_backup_db "$db" "$RBACKUP_DIR/$R_NAME") || { err "Backup pengaman gagal; restore dibatalkan."; return 1; }
+      echo "Backup pengaman: $bk"
+    fi
+  fi
+  echo
+  echo "PERINGATAN: objek di $R_NAME/$db yang ada di backup akan DIHAPUS lalu dibuat ulang."
+  echo "            Objek dibuat atas nama user $R_USER (--no-owner, --no-acl)."
+  read -r -p "Ketik $R_NAME/$db untuk melanjutkan: " confirm
+  [[ "$confirm" == "$R_NAME/$db" ]] || { echo "Dibatalkan."; return 0; }
+  log "Restore $file -> $R_NAME/$db"
+  if ! rc_run pg_restore -d "$db" --no-owner --no-acl --clean --if-exists --single-transaction --exit-on-error < "$file"; then
+    err "Restore gagal. Karena --single-transaction, $R_NAME/$db tidak berubah."
+    return 1
+  fi
+  echo "Restore selesai ke $R_NAME/$db."
 }
 
 # ---------------------------------------------------------------------------
@@ -1312,7 +1846,7 @@ safe_rm_in_base() {
 uninstall_instance() {
   load_config || return 1
   local final_bk="" del_data="" del_backups="" confirm="" others=""
-  local -a cfg_files=(.env compose.yaml certs config backup.conf r2.conf telegram.conf)
+  local -a cfg_files=(.env compose.yaml certs config backup.conf r2.conf telegram.conf remotes)
   echo "=== Uninstall instance PostgreSQL ==="
   echo "Folder    : $BASE_DIR"
   echo "Container : $POSTGRES_CONTAINER"
@@ -1585,11 +2119,17 @@ db_from_backup_name() {
 # Output per baris: epoch|sumber|lokasi|ukuran|nama_file  (urut terbaru dulu, nama file unik,
 # salinan lokal diutamakan bila file yang sama juga ada di R2).
 collect_backups() {
-  local d listing ts size name epoch sub
+  local d listing ts size name epoch sub p rel
   {
     for d in "$BACKUP_DIR" "$AUTO_DIR" "$DOWNLOAD_DIR"; do
       [[ -d "$d" ]] || continue
       find "$d" -maxdepth 1 -type f -name '*.dump' -printf "%T@|lokal|%p|%s|%f\n" | sed -E 's/^([0-9]+)\.[0-9]+\|/\1|/'
+    done
+    for d in "$RBACKUP_DIR"/*/ "$RAUTO_DIR"/*/; do
+      [[ -d "$d" ]] || continue
+      p=$(basename "$d")
+      find "$d" -maxdepth 1 -type f -name '*.dump' \
+        -printf "%T@|lokal:$p|%p|%s|%f\n" | sed -E 's/^([0-9]+)\.[0-9]+\|/\1|/'
     done
     if r2_configured; then
       for sub in auto manual; do
@@ -1603,8 +2143,18 @@ collect_backups() {
           echo "Peringatan: gagal membaca daftar backup R2 ($sub); hanya backup lokal yang ditampilkan." >&2
         fi
       done
+      for sub in auto/remote manual/remote; do
+        if listing=$(rclone_run lsf "$(r2_path "$sub")" -R --files-only --format "tsp" --separator ";" --include '*.dump' 2>/dev/null); then
+          while IFS=';' read -r ts size rel; do
+            [[ "$rel" == */* ]] || continue
+            p=${rel%%/*}; name=${rel##*/}
+            epoch=$(date -d "$ts" +%s 2>/dev/null) || continue
+            printf '%s|R2:%s|%s|%s|%s\n' "$epoch" "${sub%%/*}:$p" "$sub/$rel" "$size" "$name"
+          done <<< "$listing"
+        fi
+      done
     fi
-  } | awk -F'|' '!($5 in best) || ($2 == "lokal" && src[$5] != "lokal") { best[$5] = $0; src[$5] = $2 }
+  } | awk -F'|' '!($5 in best) || ($2 ~ /^lokal/ && src[$5] !~ /^lokal/) { best[$5] = $0; src[$5] = $2 }
                  END { for (k in best) print best[k] }' | sort -t'|' -k1,1nr
 }
 
@@ -1626,11 +2176,11 @@ pick_backup() {
   (( ${#rows[@]} > 0 )) || { err "Tidak ada backup .dump yang ditemukan${filter:+ untuk '$filter'}."; return 1; }
 
   {
-    printf '\n %3s  %-16s  %-10s  %-20s  %8s  %s\n' "No" "Waktu" "Sumber" "Database" "Ukuran" "File"
+    printf '\n %3s  %-16s  %-22s  %-20s  %8s  %s\n' "No" "Waktu" "Sumber" "Database" "Ukuran" "File"
     for r in "${rows[@]}"; do
       i=$((i+1))
       IFS='|' read -r epoch src loc size name <<< "$r"
-      printf ' %3d  %-16s  %-10s  %-20s  %8s  %s\n' "$i" "$(date -d "@$epoch" '+%Y-%m-%d %H:%M')" "$src" \
+      printf ' %3d  %-16s  %-22s  %-20s  %8s  %s\n' "$i" "$(date -d "@$epoch" '+%Y-%m-%d %H:%M')" "$src" \
         "$(db_from_backup_name "$name")" "$(numfmt --to=iec "$size" 2>/dev/null || echo "$size")" "$name"
     done
     echo
@@ -1645,7 +2195,7 @@ pick_backup() {
   fi
   [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#rows[@]} )) || { err "Pilihan tidak valid."; return 1; }
   IFS='|' read -r epoch src loc size name <<< "${rows[$((pick-1))]}"
-  if [[ "$src" == lokal ]]; then
+  if [[ "$src" == lokal* ]]; then
     printf '%s\n' "$loc"
   else
     load_r2_conf || { err "Konfigurasi R2 tidak lengkap."; return 1; }
@@ -1661,9 +2211,13 @@ pick_backup() {
 restore_database() {
   require_running || return 1
   local file db confirm owner role_args=() pre def_db rc
-  rc=0; file=$(pick_backup) || rc=$?
-  (( rc != 2 )) || { echo "Dibatalkan."; return 0; }
-  (( rc == 0 )) || return 1
+  if [[ -n "${1:-}" ]]; then
+    file=$1
+  else
+    rc=0; file=$(pick_backup) || rc=$?
+    (( rc != 2 )) || { echo "Dibatalkan."; return 0; }
+    (( rc == 0 )) || return 1
+  fi
   [[ -f "$file" && -r "$file" ]] || { err "File tidak ditemukan / tidak bisa dibaca: $file"; return 1; }
   if ! docker exec -i "$POSTGRES_CONTAINER" pg_restore -l < "$file" >/dev/null 2>&1; then
     err "File bukan arsip pg_dump format custom (-Fc) yang valid, atau dibuat oleh pg_dump yang lebih baru dari server."
@@ -1990,6 +2544,7 @@ main_menu() {
     echo "15. Hapus database + user"
     echo "16. Rotasi sertifikat SSL"
     echo "17. Uninstall instance (hapus container, opsional data)"
+    echo "18. Server remote: backup & restore (server PostgreSQL lain)"
     echo " 0. Keluar"
     echo "=============================================="
     if ! read -r -p "Pilih menu: " choice; then echo; exit 0; fi
@@ -2012,6 +2567,7 @@ main_menu() {
       15) run_action drop_database ;;
       16) run_action rotate_ssl ;;
       17) run_action uninstall_instance ;;
+      18) run_action remote_menu ;;
       0) echo "Selesai."; exit 0 ;;
       *) echo "Pilihan tidak dikenal."; pause ;;
     esac
