@@ -14,3 +14,6 @@ data/
 certs/
 config/
 backups/
+telegram.conf
+.tgconf.*
+.ssl.*

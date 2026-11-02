@@ -111,6 +111,9 @@ masuk sebagai user biasa.
 12. Lihat PostgreSQL logs
 13. Ganti password user/role
 14. Auto backup & Cloudflare R2
+15. Hapus database + user
+16. Rotasi sertifikat SSL
+17. Uninstall instance (hapus container, opsional data)
  0. Keluar
 ```
 
@@ -305,6 +308,9 @@ Pilih menu **14. Auto backup & Cloudflare R2**:
   5. Atur kredensial Cloudflare R2
   6. Tes koneksi R2
   7. Lihat & download backup dari R2
+  8. Atur notifikasi Telegram
+  9. Tes notifikasi Telegram
+ 10. Matikan notifikasi Telegram
 ```
 
 Saat mengaktifkan jadwal, isi:
@@ -549,6 +555,94 @@ Catatan:
     Password user lain minimal 12 karakter.
 -   Mengganti **nama** user tidak didukung.
 
+## Hapus database + user
+
+Menu **15**. Langkah:
+
+1.  Pilih database dari daftar.
+2.  Script menampilkan jumlah koneksi aktif dan user/role terkait. Jika ada
+    koneksi aktif, Anda diminta setuju memutusnya (jika tidak, dibatalkan).
+3.  Pilih apakah user/role yang **hanya** dipakai untuk database ini ikut
+    dihapus (default: ya).
+4.  Backup database dulu (default: ya) ke `backups/`.
+5.  Ketik ulang **nama database** untuk konfirmasi.
+
+Detail PostgreSQL:
+
+-   Database utama admin (`POSTGRES_DB` di `.env`) dan database sistem
+    (`postgres`, `template0/1`) tidak bisa dihapus dari menu ini.
+-   Koneksi aktif diputus dengan `DROP DATABASE ... WITH (FORCE)`.
+-   Role pemilik ditawarkan untuk dihapus hanya jika bukan admin/superuser dan
+    tidak memiliki database lain. Jika role masih punya objek/hak di database
+    lain, role tidak dihapus dan alasannya ditampilkan.
+
+## Rotasi sertifikat SSL
+
+Menu **16** menampilkan sertifikat yang sedang dipakai (subject, issuer,
+tanggal berakhir, sisa hari), lalu:
+
+  Pilihan   Fungsi
+  --------- ----------------------------------------------------------------------
+  1         Buat sertifikat self-signed baru (berlaku 10 tahun)
+  2         Pakai sertifikat sendiri (mis. dari CA / Let's Encrypt): fullchain + key
+
+Untuk pilihan 2, script memastikan file berformat PEM, key tidak ber-passphrase,
+key **cocok** dengan sertifikat, dan sertifikat belum kedaluwarsa.
+
+-   Sertifikat lama disimpan di `backups/ssl-YYYYMMDD-HHMMSS/`.
+-   Sertifikat baru dimuat **tanpa restart**.
+-   Jika server menolak sertifikat baru, file lama otomatis dikembalikan dan
+    server tetap memakai sertifikat sebelumnya.
+-   Bagian atas menu menampilkan **peringatan** jika sertifikat berakhir dalam
+    kurang dari 30 hari (atau sudah kedaluwarsa); peringatan yang sama ikut
+    dikirim di notifikasi Telegram.
+
+Lokasi sertifikat: `certs/server.crt` dan `certs/server.key` (di-mount satu per satu ke container; ditulis ulang di tempat agar container langsung melihat file baru, lalu `pg_reload_conf()`).
+
+## Notifikasi Telegram
+
+Menu **14 → 8** (auto backup & R2):
+
+1.  Buat bot lewat **@BotFather** → dapatkan token (`123456:ABC...`).
+2.  Kirim pesan ke bot (atau tambahkan bot ke grup), lalu ambil chat ID dari
+    `https://api.telegram.org/bot<TOKEN>/getUpdates` (field `chat.id`; grup
+    biasanya diawali `-100`).
+3.  Isi token, chat ID, dan kapan dikirim: **hanya jika gagal** (default) atau
+    **setiap auto backup**. Pesan tes langsung dikirim.
+
+Isi pesan: status (✅/❌), host, folder, container, ringkasan per database,
+status upload R2, baris error, dan peringatan sertifikat jika ada.
+
+-   Disimpan di `telegram.conf` (root, `600`). Token dikirim ke `curl` lewat
+    stdin sehingga tidak muncul di `ps`. Butuh `curl` di host.
+-   Gagal mengirim notifikasi **tidak** mengubah status backup (backup sukses
+    tetap tercatat sukses).
+-   Menu 14 → 9 mengirim pesan tes, 14 → 10 mematikan notifikasi.
+
+## Uninstall instance
+
+Menu **17**. Yang selalu dilakukan:
+
+-   Jadwal auto backup instance ini dimatikan.
+-   Container dihentikan dan dihapus (`docker compose down`).
+-   Salinan script di `/usr/local/sbin` dihapus **hanya jika** tidak dipakai
+    instance lain.
+
+Yang ditanyakan:
+
+  Pertanyaan                                   Default   Catatan
+  -------------------------------------------- --------- -------------------------------
+  Backup terakhir semua database               Ya        Ke `backups/`
+  Hapus data (`data/`) + konfigurasi            Tidak     Butuh ketik `HAPUS DATA`
+  Hapus folder `backups/`                       Tidak     Hanya ditanya jika data dihapus
+
+Konfirmasi akhir: ketik **nama container**. Script itu sendiri, backup di R2,
+dan image Docker tidak dihapus.
+
+-   Data disimpan → instance bisa dinyalakan lagi dengan menu 2.
+-   Data dihapus → folder kembali ke kondisi "Belum setup" dan siap untuk
+    setup baru (menu 1).
+
 ## Koneksi dan SSL
 
 PostgreSQL dijalankan dengan SSL aktif menggunakan sertifikat
@@ -635,8 +729,7 @@ Sesuaikan nama container jika saat setup memilih nama yang berbeda.
 
 -   Script mengelola satu instance/container PostgreSQL per folder proyek
     (folder tempat script berada).
--   Script tidak menyediakan penghapusan database/role, ganti nama role,
-    rotasi sertifikat, atau pengelolaan firewall.
+-   Script tidak menyediakan ganti nama role atau pengelolaan firewall.
 -   Menu backup meminta nama database dan menggunakan role admin dari
     konfigurasi untuk menjalankan `pg_dump`.
 -   Menu restore membutuhkan file `.dump` yang tersedia di filesystem

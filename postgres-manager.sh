@@ -850,6 +850,11 @@ schedule_status() {
   else
     echo "R2          : belum dikonfigurasi"
   fi
+  if tg_configured; then
+    echo "Telegram    : aktif (kirim saat: $([[ "$TG_NOTIFY" == always ]] && echo 'setiap backup' || echo 'gagal saja'))"
+  else
+    echo "Telegram    : belum dikonfigurasi"
+  fi
   echo "Folder lokal: $AUTO_DIR"
   if has_systemd && systemctl is-enabled "$SYSTEMD_UNIT.timer" >/dev/null 2>&1; then
     echo "Scheduler   : systemd timer AKTIF"
@@ -984,19 +989,412 @@ schedule_menu() {
   echo "  5. Atur kredensial Cloudflare R2"
   echo "  6. Tes koneksi R2"
   echo "  7. Lihat & download backup dari R2"
+  echo "  8. Atur notifikasi Telegram"
+  echo "  9. Tes notifikasi Telegram"
+  echo " 10. Matikan notifikasi Telegram"
   echo "  0. Kembali"
   read -r -p "Pilihan: " c
   case "$c" in
     1) schedule_enable ;;
     2) schedule_disable ;;
-    3) backup_auto ;;
+    3) backup_auto_notify ;;
     4) schedule_logs ;;
     5) r2_configure ;;
     6) r2_test ;;
     7) r2_browse_download ;;
+    8) tg_configure ;;
+    9) tg_test ;;
+    10) tg_disable ;;
     *) return 0 ;;
   esac
 }
+
+# ---------------------------------------------------------------------------
+# NOTIFIKASI TELEGRAM
+# ---------------------------------------------------------------------------
+TG_CONF="$BASE_DIR/telegram.conf"
+TG_API_BASE="${TG_API_BASE:-https://api.telegram.org}"
+
+load_tg_conf() {
+  TG_BOT_TOKEN="" TG_CHAT_ID="" TG_NOTIFY="fail"
+  [[ -f "$TG_CONF" ]] || return 1
+  local key value
+  while IFS='=' read -r key value || [[ -n "$key" ]]; do
+    key=${key//[[:space:]]/}; value=${value//$'\r'/}
+    case "$key" in
+      TG_BOT_TOKEN) if [[ "$value" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then TG_BOT_TOKEN=$value; fi ;;
+      TG_CHAT_ID)   if [[ "$value" =~ ^(-?[0-9]+|@[A-Za-z0-9_]{5,})$ ]]; then TG_CHAT_ID=$value; fi ;;
+      TG_NOTIFY)    if [[ "$value" == "fail" || "$value" == "always" ]]; then TG_NOTIFY=$value; fi ;;
+    esac
+  done < "$TG_CONF"
+  [[ -n "$TG_BOT_TOKEN" && -n "$TG_CHAT_ID" ]]
+}
+
+tg_configured() { load_tg_conf 2>/dev/null; }
+
+# Kirim pesan. Token hanya lewat stdin curl (-K -), tidak muncul di daftar proses.
+tg_send() {
+  local text=$1
+  load_tg_conf || { err "Telegram belum dikonfigurasi."; return 1; }
+  command -v curl >/dev/null 2>&1 || { err "curl tidak tersedia; notifikasi Telegram tidak bisa dikirim."; return 1; }
+  (( ${#text} <= 4000 )) || text="${text:0:3990}…"
+  local resp
+  resp=$(printf 'url = "%s/bot%s/sendMessage"\n' "$TG_API_BASE" "$TG_BOT_TOKEN" \
+    | curl -sS --max-time 20 -K - \
+        --data-urlencode "chat_id=$TG_CHAT_ID" \
+        --data-urlencode "text=$text" \
+        --data-urlencode "disable_web_page_preview=true" 2>&1) || { err "Gagal menghubungi Telegram: $resp"; return 1; }
+  if ! grep -qE '"ok"[[:space:]]*:[[:space:]]*true' <<< "$resp"; then
+    err "Telegram menolak pesan: $(sed -nE 's/.*"description"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' <<< "$resp" | head -n1)"
+    return 1
+  fi
+}
+
+tg_configure() {
+  load_tg_conf || true
+  local token chat mode
+  echo "Siapkan dulu:"
+  echo "  1. Buat bot lewat @BotFather di Telegram -> dapatkan token (format 123456:ABC...)."
+  echo "  2. Kirim pesan apa saja ke bot (atau tambahkan bot ke grup), lalu ambil chat ID"
+  echo "     dari https://api.telegram.org/bot<TOKEN>/getUpdates (field chat.id)."
+  echo "Kosongkan isian untuk memakai nilai lama (jika ada)."
+  read -r -s -p "Bot token [${TG_BOT_TOKEN:+(tersimpan)}]: " token; echo; token=${token:-$TG_BOT_TOKEN}
+  [[ "$token" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || { err "Format token tidak valid."; return 1; }
+  read -r -p "Chat ID [${TG_CHAT_ID:-}]: " chat; chat=${chat:-$TG_CHAT_ID}
+  [[ "$chat" =~ ^(-?[0-9]+|@[A-Za-z0-9_]{5,})$ ]] || { err "Chat ID tidak valid (angka, -100... untuk grup/channel, atau @namachannel)."; return 1; }
+  echo "Kirim notifikasi kapan?"
+  echo "  1. Hanya jika auto backup gagal"
+  echo "  2. Setiap auto backup (berhasil maupun gagal)"
+  local cur=1; [[ "$TG_NOTIFY" == "always" ]] && cur=2
+  read -r -p "Pilihan [$cur]: " mode; mode=${mode:-$cur}
+  case "$mode" in 1) mode=fail ;; 2) mode=always ;; *) err "Pilihan tidak valid."; return 1 ;; esac
+  local tmp; tmp=$(mktemp "$BASE_DIR/.tgconf.XXXXXX")
+  printf 'TG_BOT_TOKEN=%s\nTG_CHAT_ID=%s\nTG_NOTIFY=%s\n' "$token" "$chat" "$mode" > "$tmp"
+  chmod 600 "$tmp"; chown root:root "$tmp"; mv -f "$tmp" "$TG_CONF"
+  echo "Tersimpan di $TG_CONF (permission 600)."
+  tg_test
+}
+
+tg_test() {
+  tg_send "✅ Tes notifikasi PostgreSQL manager
+Host: $(hostname -s 2>/dev/null || echo '?')
+Folder: $BASE_DIR" && echo "Pesan tes terkirim. Cek Telegram Anda."
+}
+
+tg_disable() {
+  if [[ -f "$TG_CONF" ]]; then
+    rm -f -- "$TG_CONF"
+    echo "Notifikasi Telegram dimatikan ($TG_CONF dihapus)."
+  else
+    echo "Notifikasi Telegram belum aktif."
+  fi
+}
+
+# Jalankan auto backup, simpan log-nya, lalu kirim ringkasan ke Telegram sesuai pengaturan.
+backup_auto_notify() {
+  local logf rc
+  logf=$(mktemp)
+  set +e
+  ( set -e; backup_auto ) 2>&1 | tee "$logf"
+  rc=${PIPESTATUS[0]}
+  set -e
+  # backup_auto berjalan di subshell; muat ulang konfigurasi untuk isi pesan.
+  load_config >/dev/null 2>&1 || true
+  if tg_configured && { (( rc != 0 )) || [[ "$TG_NOTIFY" == "always" ]]; }; then
+    local status icon body cert_warn
+    if (( rc == 0 )); then icon="✅"; status="BERHASIL"; else icon="❌"; status="GAGAL"; fi
+    body=$(grep -E 'Backup |GAGAL|ERROR|gagal|selesai|R2|Hapus' "$logf" | sed -E 's/^\[[0-9-]+ ([0-9:]+)\] /\1 /' | tail -n 25)
+    cert_warn=$(cert_expiry_warning 2>/dev/null || true)
+    tg_send "$icon Auto backup PostgreSQL $status
+Host: $(hostname -s 2>/dev/null || echo '?')
+Folder: $BASE_DIR
+Container: ${POSTGRES_CONTAINER:-?}
+${cert_warn:+⚠️ $cert_warn
+}
+$body" >/dev/null || echo "Peringatan: notifikasi Telegram gagal dikirim." >&2
+  fi
+  rm -f -- "$logf"
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# UNINSTALL INSTANCE
+# ---------------------------------------------------------------------------
+# Hapus path di dalam folder proyek saja (pengaman tambahan untuk rm -rf).
+safe_rm_in_base() {
+  local p
+  for p in "$@"; do
+    [[ -n "$p" && "$p" == "$BASE_DIR"/* && "$p" != *"/../"* && "$p" != *"/.." ]] || { err "Menolak menghapus path di luar folder proyek: '$p'"; return 1; }
+    [[ -e "$p" || -L "$p" ]] || continue
+    rm -rf -- "${p:?}"
+  done
+}
+
+uninstall_instance() {
+  load_config || return 1
+  local final_bk="" del_data="" del_backups="" confirm="" others=""
+  local -a cfg_files=(.env compose.yaml certs config backup.conf r2.conf telegram.conf)
+  echo "=== Uninstall instance PostgreSQL ==="
+  echo "Folder    : $BASE_DIR"
+  echo "Container : $POSTGRES_CONTAINER"
+  echo
+  echo "Yang SELALU dilakukan:"
+  echo "  - Menghentikan & menghapus container (docker compose down)"
+  echo "  - Mematikan jadwal auto backup instance ini"
+  echo "Yang opsional (ditanya satu per satu):"
+  echo "  - Backup terakhir semua database sebelum uninstall"
+  echo "  - Menghapus data database (data/) beserta konfigurasi (.env, compose.yaml, dll.)"
+  echo "  - Menghapus folder backups/"
+  echo "Script ini sendiri ($(basename "$SCRIPT_PATH")) tidak dihapus. Backup di R2 tidak disentuh."
+  echo
+
+  if container_running; then
+    read -r -p "Buat backup terakhir semua database dulu? [Y/n]: " final_bk
+    if [[ "${final_bk,,}" != "n" ]]; then
+      local d f failed=0 dbs=()
+      mapfile -t dbs < <(list_app_databases)
+      for d in "${dbs[@]}"; do
+        [[ -n "$d" ]] || continue
+        if f=$(do_backup "$d"); then echo "OK    $f"; else echo "GAGAL $d"; failed=1; fi
+      done
+      do_globals >/dev/null || failed=1
+      if (( failed )); then
+        read -r -p "Sebagian backup gagal. Tetap lanjut uninstall? [y/N]: " confirm
+        [[ "${confirm,,}" == "y" ]] || { echo "Dibatalkan."; return 0; }
+      fi
+    fi
+  else
+    echo "Catatan: container tidak berjalan, backup terakhir tidak bisa dibuat."
+  fi
+
+  read -r -p "Hapus juga DATA database (data/) dan konfigurasinya? Tidak bisa dibatalkan. [y/N]: " del_data
+  if [[ "${del_data,,}" == "y" ]]; then
+    read -r -p "Hapus juga folder backups/ (termasuk semua backup lokal)? [y/N]: " del_backups
+  fi
+
+  echo
+  echo "Ringkasan:"
+  echo "  - Container $POSTGRES_CONTAINER dihentikan & dihapus"
+  echo "  - Jadwal auto backup dimatikan"
+  if [[ "${del_data,,}" == "y" ]]; then
+    echo "  - DIHAPUS: data/ dan ${cfg_files[*]}"
+  else
+    echo "  - Data & konfigurasi DISIMPAN (bisa dijalankan lagi dengan menu 2)"
+  fi
+  [[ "${del_backups,,}" == "y" ]] && echo "  - DIHAPUS: backups/"
+  read -r -p "Ketik nama container ($POSTGRES_CONTAINER) untuk melanjutkan: " confirm
+  [[ "$confirm" == "$POSTGRES_CONTAINER" ]] || { echo "Dibatalkan."; return 0; }
+  if [[ "${del_data,,}" == "y" ]]; then
+    read -r -p "Ketik HAPUS DATA untuk konfirmasi penghapusan data: " confirm
+    [[ "$confirm" == "HAPUS DATA" ]] || { echo "Dibatalkan (tidak ada yang diubah)."; return 0; }
+  fi
+
+  log "Mematikan jadwal auto backup"
+  schedule_disable >/dev/null 2>&1 || true
+  log "docker compose down"
+  (cd "$BASE_DIR" && docker compose down --remove-orphans) || { err "docker compose down gagal; tidak ada data yang dihapus."; return 1; }
+
+  # Salinan script untuk scheduler dihapus hanya jika tidak ada instance lain yang memakainya.
+  others=$(ls /etc/systemd/system/pgm-backup-*.timer /etc/cron.d/pgm-backup-* 2>/dev/null || true)
+  if [[ -z "$others" && -f "$INSTALLED_BIN" ]]; then
+    rm -f -- "$INSTALLED_BIN" && log "Hapus $INSTALLED_BIN (tidak dipakai instance lain)"
+  fi
+
+  if [[ "${del_data,,}" == "y" ]]; then
+    local -a targets=("$BASE_DIR/data")
+    local c
+    for c in "${cfg_files[@]}"; do targets+=("$BASE_DIR/$c"); done
+    log "Menghapus data & konfigurasi"
+    safe_rm_in_base "${targets[@]}" || return 1
+    rm -f -- "$BASE_DIR"/.backup.lock
+  fi
+  if [[ "${del_backups,,}" == "y" ]]; then
+    log "Menghapus backups/"
+    safe_rm_in_base "$BACKUP_DIR" || return 1
+  fi
+  echo
+  echo "Uninstall selesai."
+  if [[ "${del_data,,}" == "y" ]]; then
+    echo "Folder $BASE_DIR siap dipakai untuk setup baru (menu 1)."
+  else
+    echo "Data tetap di $BASE_DIR/data. Jalankan menu 2 untuk menyalakan lagi."
+  fi
+  [[ "${del_backups,,}" == "y" ]] || echo "Backup lokal tetap di $BACKUP_DIR."
+  echo "Image Docker tidak dihapus; hapus manual jika perlu: docker image rm <image>"
+}
+
+# ---------------------------------------------------------------------------
+# HAPUS DATABASE + ROLE
+# ---------------------------------------------------------------------------
+drop_database() {
+  require_running || return 1
+  local db owner conns force="" pre confirm drop_role="" others super kill
+  echo "Database aplikasi:"
+  list_app_databases | sed 's/^/  - /'
+  read -r -p "Nama database yang akan DIHAPUS: " db
+  valid_identifier "$db" || { err "Nama database tidak valid."; return 1; }
+  db_exists "$db" || { err "Database '$db' tidak ditemukan."; return 1; }
+  case "$db" in postgres|template0|template1) err "Database sistem tidak boleh dihapus."; return 1 ;; esac
+  [[ "$db" != "$POSTGRES_DB" ]] || { err "'$db' adalah database utama admin (POSTGRES_DB) yang dipakai script untuk koneksi; tidak bisa dihapus dari menu ini."; return 1; }
+
+  owner=$(psql_admin -tAc "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname=$(sql_literal "$db")" | tr -d '[:space:]')
+  conns=$(psql_admin -tAc "SELECT count(*) FROM pg_stat_activity WHERE datname=$(sql_literal "$db")" | tr -d '[:space:]')
+  echo "Owner           : $owner"
+  echo "Koneksi aktif   : $conns"
+  if [[ "$conns" =~ ^[0-9]+$ ]] && (( conns > 0 )); then
+    read -r -p "Ada $conns koneksi aktif. Putuskan semuanya saat menghapus? [y/N]: " kill
+    [[ "${kill,,}" == "y" ]] || { echo "Dibatalkan. Hentikan aplikasi yang memakai '$db' dulu."; return 0; }
+    force=1
+  fi
+  if [[ -n "$owner" && "$owner" != "$POSTGRES_USER" ]]; then
+    super=$(psql_admin -tAc "SELECT rolsuper FROM pg_roles WHERE rolname=$(sql_literal "$owner")" | tr -d '[:space:]')
+    others=$(psql_admin -tAc "SELECT string_agg(datname, ', ') FROM pg_database WHERE pg_get_userbyid(datdba)=$(sql_literal "$owner") AND datname <> $(sql_literal "$db")" | sed 's/^ *//;s/ *$//')
+    if [[ "$super" == "t" ]]; then
+      echo "Role '$owner' adalah superuser; tidak ditawarkan untuk dihapus."
+    elif [[ -n "$others" ]]; then
+      echo "Role '$owner' juga pemilik database lain ($others); role tidak dihapus."
+    else
+      read -r -p "Hapus juga role/user '$owner'? [Y/n]: " drop_role
+      [[ "${drop_role,,}" == "n" ]] && drop_role="" || drop_role=$owner
+    fi
+  fi
+  read -r -p "Backup database '$db' dulu sebelum dihapus? [Y/n]: " pre
+  if [[ "${pre,,}" != "n" ]]; then
+    local bk
+    bk=$(do_backup "$db") || { err "Backup gagal; penghapusan dibatalkan."; return 1; }
+    echo "Backup: $bk"
+  fi
+  echo
+  echo "AKAN DIHAPUS PERMANEN: database '$db'${drop_role:+ dan role '$drop_role'}."
+  read -r -p "Ketik nama database ($db) untuk konfirmasi: " confirm
+  [[ "$confirm" == "$db" ]] || { echo "Dibatalkan."; return 0; }
+
+  if [[ -n "$force" ]]; then
+    if (( $(psql_admin -tAc "SHOW server_version_num" | tr -d '[:space:]') >= 130000 )); then
+      psql_admin -q -c "DROP DATABASE $(sql_ident "$db") WITH (FORCE);" || { err "Gagal menghapus database."; return 1; }
+    else
+      psql_admin -q -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$(sql_literal "$db") AND pid <> pg_backend_pid();" >/dev/null
+      psql_admin -q -c "DROP DATABASE $(sql_ident "$db");" || { err "Gagal menghapus database."; return 1; }
+    fi
+  else
+    psql_admin -q -c "DROP DATABASE $(sql_ident "$db");" || { err "Gagal menghapus database (masih ada koneksi?)."; return 1; }
+  fi
+  echo "Database '$db' dihapus."
+  if [[ -n "$drop_role" ]]; then
+    if psql_admin -q -c "DROP ROLE $(sql_ident "$drop_role");" 2>/tmp/.pgm-droprole.$$; then
+      echo "Role '$drop_role' dihapus."
+    else
+      echo "Role '$drop_role' TIDAK dihapus: $(head -n 2 /tmp/.pgm-droprole.$$ | tr '\n' ' ')"
+      echo "(biasanya karena role masih punya objek/hak di database lain)"
+    fi
+    rm -f -- /tmp/.pgm-droprole.$$
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# SERTIFIKAT SSL
+# ---------------------------------------------------------------------------
+SSL_CERT_FILE="$CERT_DIR/server.crt"
+SSL_KEY_FILE="$CERT_DIR/server.key"
+
+cert_days_left() {
+  local f=${1:-$SSL_CERT_FILE} end
+  [[ -r "$f" ]] || return 1
+  end=$(openssl x509 -in "$f" -noout -enddate 2>/dev/null | cut -d= -f2) || return 1
+  echo $(( ( $(date -d "$end" +%s) - $(date +%s) ) / 86400 ))
+}
+
+cert_expiry_warning() {
+  local d
+  d=$(cert_days_left) || return 0
+  if (( d < 0 )); then
+    echo "Sertifikat SSL sudah KEDALUWARSA $(( -d )) hari lalu. Rotasi lewat menu 16."
+  elif (( d < 30 )); then
+    echo "Sertifikat SSL berakhir dalam $d hari. Rotasi lewat menu 16."
+  fi
+}
+
+show_cert_info() {
+  local f=$1
+  openssl x509 -in "$f" -noout -subject -issuer -enddate 2>/dev/null | sed -E 's/^subject=/  Subject : /; s/^issuer=/  Issuer  : /; s/^notAfter=/  Berlaku s.d.: /'
+  echo "  Sisa    : $(cert_days_left "$f") hari"
+}
+
+# Fingerprint sertifikat yang benar-benar disajikan server (via STARTTLS postgres).
+served_fingerprint() {
+  local host=$POSTGRES_BIND
+  [[ "$host" == "0.0.0.0" ]] && host=127.0.0.1
+  timeout 10 openssl s_client -starttls postgres -connect "$host:$POSTGRES_PORT" </dev/null 2>/dev/null \
+    | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2
+}
+
+rotate_ssl() {
+  load_config || return 1
+  need_cmd openssl || return 1
+  [[ -f "$SSL_CERT_FILE" && -f "$SSL_KEY_FILE" ]] || { err "Sertifikat tidak ditemukan di $CERT_DIR (stack dibuat manual?)."; return 1; }
+  local choice tmpd ts bdir crt_in key_in newfp servedfp
+  echo "Sertifikat saat ini:"
+  show_cert_info "$SSL_CERT_FILE"
+  echo
+  echo "  1. Buat sertifikat self-signed baru (berlaku 10 tahun)"
+  echo "  2. Pakai sertifikat sendiri (mis. dari CA / Let's Encrypt): file .crt/fullchain + .key"
+  echo "  0. Batal"
+  read -r -p "Pilihan: " choice
+  case "$choice" in 1|2) ;; *) echo "Dibatalkan."; return 0 ;; esac
+
+  tmpd=$(mktemp -d "$BASE_DIR/.ssl.XXXXXX")
+  if [[ "$choice" == 1 ]]; then
+    openssl req -new -x509 -days 3650 -nodes -newkey rsa:2048 \
+      -out "$tmpd/crt" -keyout "$tmpd/key" -subj "/CN=$POSTGRES_CONTAINER" >/dev/null 2>&1 \
+      || { safe_rm_in_base "$tmpd"; err "Gagal membuat sertifikat."; return 1; }
+  else
+    read -r -p "Path file sertifikat (.crt / fullchain.pem): " crt_in; crt_in=$(expand_path "$crt_in")
+    read -r -p "Path file private key (.key / privkey.pem): " key_in; key_in=$(expand_path "$key_in")
+    [[ -r "$crt_in" && -r "$key_in" ]] || { safe_rm_in_base "$tmpd"; err "File tidak ditemukan / tidak bisa dibaca."; return 1; }
+    openssl x509 -in "$crt_in" -noout 2>/dev/null || { safe_rm_in_base "$tmpd"; err "File sertifikat tidak valid (harus PEM)."; return 1; }
+    openssl pkey -in "$key_in" -noout 2>/dev/null || { safe_rm_in_base "$tmpd"; err "Private key tidak valid atau terenkripsi passphrase."; return 1; }
+    if [[ "$(openssl x509 -in "$crt_in" -noout -pubkey 2>/dev/null)" != "$(openssl pkey -in "$key_in" -pubout 2>/dev/null)" ]]; then
+      safe_rm_in_base "$tmpd"; err "Private key tidak cocok dengan sertifikat."; return 1
+    fi
+    openssl x509 -in "$crt_in" -noout -checkend 0 >/dev/null 2>&1 || { safe_rm_in_base "$tmpd"; err "Sertifikat sudah kedaluwarsa."; return 1; }
+    cat -- "$crt_in" > "$tmpd/crt"; cat -- "$key_in" > "$tmpd/key"
+  fi
+  echo "Sertifikat baru:"
+  show_cert_info "$tmpd/crt"
+
+  ts=$(date +%Y%m%d-%H%M%S)
+  bdir="$BACKUP_DIR/ssl-$ts"
+  mkdir -p "$bdir"; chmod 700 "$bdir"
+  cp -p -- "$SSL_CERT_FILE" "$SSL_KEY_FILE" "$bdir/"
+  # Tulis di tempat (inode sama): file di-bind-mount satu per satu ke container,
+  # file baru dengan inode lain tidak akan terlihat dari dalam container.
+  cat -- "$tmpd/crt" > "$SSL_CERT_FILE"
+  cat -- "$tmpd/key" > "$SSL_KEY_FILE"
+  newfp=$(openssl x509 -in "$tmpd/crt" -noout -fingerprint -sha256 | cut -d= -f2)
+  safe_rm_in_base "$tmpd"
+  echo "Sertifikat lama disimpan di $bdir"
+
+  if container_running; then
+    psql_admin -q -c "SELECT pg_reload_conf();" >/dev/null || { err "Reload konfigurasi gagal."; return 1; }
+    sleep 1
+    servedfp=$(served_fingerprint || true)
+    if [[ -z "$servedfp" ]]; then
+      echo "Reload dikirim. Verifikasi otomatis tidak bisa dilakukan (port tidak terjangkau dari host);"
+      echo "cek dengan menu 11 dan log (menu 12)."
+    elif [[ "$servedfp" == "$newfp" ]]; then
+      echo "Server sudah memakai sertifikat baru (tanpa restart)."
+    else
+      err "Server masih menyajikan sertifikat lama; kemungkinan sertifikat/key baru ditolak (lihat log)."
+      cat -- "$bdir/server.crt" > "$SSL_CERT_FILE"; cat -- "$bdir/server.key" > "$SSL_KEY_FILE"
+      psql_admin -q -c "SELECT pg_reload_conf();" >/dev/null || true
+      err "Sertifikat lama dikembalikan."
+      return 1
+    fi
+  else
+    echo "Container tidak berjalan; sertifikat baru dipakai saat container dinyalakan."
+  fi
+}
+
 
 # Nama database dari nama file backup: <db>-YYYYMMDD-HHMMSS[-pid].dump
 db_from_backup_name() {
@@ -1371,7 +1769,7 @@ run_action() {
 }
 
 main_menu() {
-  local choice
+  local choice cw
   # Ctrl+C membatalkan aksi yang sedang berjalan, bukan menutup manager.
   trap 'echo' INT
   while true; do
@@ -1383,6 +1781,8 @@ main_menu() {
     if [[ -f "$ENV_FILE" ]] && load_config 2>/dev/null; then
       echo "Container: $POSTGRES_CONTAINER | Bind: $POSTGRES_BIND:$POSTGRES_PORT"
       check_ownership
+      cw=$(cert_expiry_warning 2>/dev/null || true)
+      [[ -z "$cw" ]] || echo "PERINGATAN: $cw"
     elif [[ -f "$COMPOSE_FILE" ]]; then
       echo "Status: compose.yaml ada tetapi .env tidak ditemukan/tidak valid"
     else
@@ -1403,6 +1803,9 @@ main_menu() {
     echo "12. Lihat PostgreSQL logs"
     echo "13. Ganti password user/role"
     echo "14. Auto backup & Cloudflare R2"
+    echo "15. Hapus database + user"
+    echo "16. Rotasi sertifikat SSL"
+    echo "17. Uninstall instance (hapus container, opsional data)"
     echo " 0. Keluar"
     echo "=============================================="
     if ! read -r -p "Pilih menu: " choice; then echo; exit 0; fi
@@ -1422,6 +1825,9 @@ main_menu() {
       12) run_action show_logs ;;
       13) run_action change_password ;;
       14) run_action schedule_menu ;;
+      15) run_action drop_database ;;
+      16) run_action rotate_ssl ;;
+      17) run_action uninstall_instance ;;
       0) echo "Selesai."; exit 0 ;;
       *) echo "Pilihan tidak dikenal."; pause ;;
     esac
@@ -1434,7 +1840,7 @@ case "${1:-}" in
     # Mode non-interaktif untuk scheduler (systemd timer / cron).
     need_cmd docker; need_cmd flock
     set +e
-    ( set -e; backup_auto )
+    backup_auto_notify
     exit $?
     ;;
   "") ;;
