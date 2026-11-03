@@ -65,6 +65,14 @@ load_config() {
         if [[ "$value" =~ ^[0-9]+$ ]]; then printf -v "$key" '%s' "$value"; fi ;;
     esac
   done < "$ENV_FILE"
+  # Nama project Compose wajib huruf kecil (folder seperti /mnt/data/Databases/...).
+  # .env lama dari versi sebelumnya diperbaiki di tempat.
+  local cpn
+  cpn=$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' "$ENV_FILE" | tail -n1)
+  if [[ -n "$cpn" && ! "$cpn" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+    cpn=$(printf '%s' "${cpn,,}" | tr -c 'a-z0-9_-' '-')
+    sed -i "s/^COMPOSE_PROJECT_NAME=.*/COMPOSE_PROJECT_NAME=$cpn/" "$ENV_FILE"
+  fi
   : "${POSTGRES_IMAGE:=postgres:18}"
   : "${POSTGRES_DB:=postgres}"
   : "${POSTGRES_USER:=postgres_admin}"
@@ -316,7 +324,7 @@ POSTGRES_CONTAINER=$container
 POSTGRES_DATA_TARGET=$data_target
 POSTGRES_UID=$pg_uid
 POSTGRES_GID=$pg_gid
-COMPOSE_PROJECT_NAME=pgm-${SCHED_ID}
+COMPOSE_PROJECT_NAME=pgm-${SCHED_ID,,}
 EOF
   chmod 600 "$ENV_FILE"
 
