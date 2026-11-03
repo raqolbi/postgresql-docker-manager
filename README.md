@@ -281,9 +281,11 @@ konfigurasi server.
 
 ## Backup database
 
-Pilih menu **6. Backup database**, lalu masukkan nama database, atau
-kosongkan untuk mem-backup **semua database aplikasi** (semua kecuali
-template dan `postgres`).
+Pilih menu **6. Backup database**. Database ditampilkan bernomor; isi `all`,
+nomor atau nama yang dipisah koma (mis. `1,3` atau `shop,app`), atau kosongkan
+untuk mem-backup **semua database aplikasi** (semua kecuali template dan
+`postgres`). Nama database lain yang ada di server (mis. `postgres`) juga boleh
+diketik.
 
 File backup dibuat dalam format custom PostgreSQL (`pg_dump -Fc`) dengan
 pola nama:
@@ -689,7 +691,13 @@ wajib** di-setup: `postgres-manager.sh` bisa dipakai murni sebagai tool backup.
   3. Backup sekarang
   4. Restore (ke server remote atau instance lokal)
   5. Hapus profil
+  6. Atur auto backup (yes/no) untuk satu, beberapa, atau semua profil
 ```
+
+**Backup sekarang** menampilkan database di server bernomor: isi `all`, nomor atau nama
+dipisah koma (mis. `1,3`), atau kosongkan untuk memakai daftar database di profil.
+Menu **6** mengubah status auto backup banyak profil sekaligus (pilih `all`, nomor,
+atau nama dipisah koma, lalu `yes`/`no`) tanpa membuka form ubah profil.
 
 ### Profil server
 
